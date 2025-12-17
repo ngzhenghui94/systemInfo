@@ -34,11 +34,10 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var diskUsagePercent: Double = 0
     @Published var ipAddress: String = ""
     @Published var wifiNetwork: String = ""
-    @Published var processCount: String = ""
     @Published var batteryHealth: String = ""
     @Published var batteryTemperature: String = ""
     @Published var batteryCycleCount: String = ""
-    @Published var memoryPressure: String = ""
+    @Published var freeMemory: String = ""
 
     private let networkMonitor = NetworkMonitor()
     private var timer: Timer?
@@ -98,8 +97,7 @@ final class SystemInfoViewModel: ObservableObject {
         thermalState = Self.getThermalState()
         ipAddress = Self.getIPAddress()
         wifiNetwork = Self.getWiFiSSID()
-        processCount = Self.getProcessCount()
-        memoryPressure = Self.getMemoryPressure()
+        freeMemory = Self.getFreeMemory()
         updateDiskUsage()
     }
     
@@ -445,15 +443,7 @@ final class SystemInfoViewModel: ObservableObject {
         return "Not connected"
     }
     
-    private static func getProcessCount() -> String {
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
-        var size = 0
-        sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0)
-        let count = size / MemoryLayout<kinfo_proc>.size
-        return "\(count)"
-    }
-    
-    private static func getMemoryPressure() -> String {
+    private static func getFreeMemory() -> String {
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout.size(ofValue: stats) / MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to: &stats) { ptr -> kern_return_t in
@@ -467,17 +457,15 @@ final class SystemInfoViewModel: ObservableObject {
         var pageSize: vm_size_t = 0
         host_page_size(mach_host_self(), &pageSize)
         
-        let total = Double(ProcessInfo.processInfo.physicalMemory)
-        let compressed = Double(stats.compressor_page_count) * Double(pageSize)
-        let compressedPercent = (compressed / total) * 100
+        let totalBytes = Double(ProcessInfo.processInfo.physicalMemory)
+        let freeBytes = Double(stats.free_count) * Double(pageSize)
+        let cacheBytes = Double(stats.inactive_count + stats.speculative_count) * Double(pageSize)
+        let availableBytes = freeBytes + cacheBytes
         
-        if compressedPercent < 10 {
-            return "Low"
-        } else if compressedPercent < 30 {
-            return "Medium"
-        } else {
-            return "High"
-        }
+        let availableGB = availableBytes / 1024 / 1024 / 1024
+        let totalGB = totalBytes / 1024 / 1024 / 1024
+        
+        return String(format: "%.1f / %.1f GB", availableGB, totalGB)
     }
 }
 
@@ -789,14 +777,7 @@ struct ContentView: View {
         }
     }
     
-    private var pressureColor: Color {
-        switch viewModel.memoryPressure {
-        case "Low": return .green
-        case "Medium": return .yellow
-        case "High": return .red
-        default: return .gray
-        }
-    }
+
     
     var body: some View {
         ScrollView {
@@ -884,40 +865,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
                 }
                 
-                // Hardware Section
-                GlassCard {
-                    VStack(spacing: 4) {
-                        HStack {
-                            Text("Hardware")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        .padding(.bottom, 4)
-                        
-                        StatRow(
-                            icon: "cpu",
-                            label: "Processor",
-                            value: viewModel.cpuModel,
-                            iconColor: .blue
-                        )
-                        
-                        StatRow(
-                            icon: "square.grid.2x2",
-                            label: "Cores",
-                            value: viewModel.cpuCores,
-                            iconColor: .cyan
-                        )
-                        
-                        StatRow(
-                            icon: "gpu",
-                            label: "Graphics",
-                            value: viewModel.gpuName,
-                            iconColor: .mint
-                        )
-                    }
-                }
-                
+
                 // System Details
                 GlassCard {
                     VStack(spacing: 4) {
@@ -944,13 +892,6 @@ struct ContentView: View {
                         )
                         
                         StatRow(
-                            icon: "gearshape.2",
-                            label: "Processes",
-                            value: viewModel.processCount,
-                            iconColor: .gray
-                        )
-                        
-                        StatRow(
                             icon: "thermometer.medium",
                             label: "Thermal State",
                             value: viewModel.thermalState,
@@ -958,10 +899,10 @@ struct ContentView: View {
                         )
                         
                         StatRow(
-                            icon: "gauge.with.needle",
-                            label: "Memory Pressure",
-                            value: viewModel.memoryPressure,
-                            iconColor: pressureColor
+                            icon: "memorychip",
+                            label: "Free Memory",
+                            value: viewModel.freeMemory,
+                            iconColor: .purple
                         )
                     }
                 }
