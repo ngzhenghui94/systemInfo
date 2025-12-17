@@ -7,22 +7,40 @@ struct SystemInfoSnapshot {
     let memoryUsage: String
     let uptime: String
     let freeDiskSpace: String
+    let cpuUsage: String
+    let totalDiskSpace: String
+    let diskUsagePercent: Double
 }
 
 enum SystemInfoProvider {
+    // Store previous CPU ticks for delta calculation
+    private static var previousCPUTicks: (user: Double, system: Double, idle: Double, nice: Double)?
+    
     static func snapshot() -> SystemInfoSnapshot {
         let version = ProcessInfo.processInfo.operatingSystemVersion
         let versionString = "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
 
         let uptimeString = format(uptimeSeconds: ProcessInfo.processInfo.systemUptime)
-        let freeDisk = format(bytes: getFreeDiskSpaceBytes())
+        let freeDisk = getFreeDiskSpaceBytes()
+        let totalDisk = getTotalDiskSpaceBytes()
         let memoryUsage = memoryUsageSummary()
+        let cpuUsage = cpuUsageSummary()
+        
+        let diskUsagePercent: Double
+        if totalDisk > 0 {
+            diskUsagePercent = Double(totalDisk - freeDisk) / Double(totalDisk)
+        } else {
+            diskUsagePercent = 0
+        }
 
         return SystemInfoSnapshot(
             macOSVersion: versionString,
             memoryUsage: memoryUsage,
             uptime: uptimeString,
-            freeDiskSpace: freeDisk
+            freeDiskSpace: format(bytes: freeDisk),
+            cpuUsage: cpuUsage,
+            totalDiskSpace: format(bytes: totalDisk),
+            diskUsagePercent: diskUsagePercent
         )
     }
 
@@ -31,6 +49,15 @@ enum SystemInfoProvider {
         if let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
            let capacity = values.volumeAvailableCapacityForImportantUsage {
             return capacity
+        }
+        return 0
+    }
+    
+    private static func getTotalDiskSpaceBytes() -> Int64 {
+        let url = URL(fileURLWithPath: "/")
+        if let values = try? url.resourceValues(forKeys: [.volumeTotalCapacityKey]),
+           let capacity = values.volumeTotalCapacity {
+            return Int64(capacity)
         }
         return 0
     }
@@ -52,15 +79,52 @@ enum SystemInfoProvider {
         host_page_size(mach_host_self(), &pageSize)
 
         let freeBytes = Double(stats.free_count) * Double(pageSize)
-        // Treat inactive + speculative pages as cache (similar to Activity Monitor's "Cached Files")
         let cacheBytes = Double(stats.inactive_count + stats.speculative_count) * Double(pageSize)
         let usedBytes = max(totalBytes - freeBytes - cacheBytes, 0)
 
         let usedGB = usedBytes / 1024 / 1024 / 1024
         let totalGB = totalBytes / 1024 / 1024 / 1024
 
-        // Show "used / total GB"
         return String(format: "%.1f / %.1f GB", usedGB, totalGB)
+    }
+    
+    private static func cpuUsageSummary() -> String {
+        var size = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
+        var info = host_cpu_load_info()
+
+        let result = withUnsafeMutablePointer(to: &info) { ptr -> kern_return_t in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(size)) { intPtr in
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, intPtr, &size)
+            }
+        }
+
+        guard result == KERN_SUCCESS else { return "—" }
+
+        let user = Double(info.cpu_ticks.0)
+        let system = Double(info.cpu_ticks.1)
+        let idle = Double(info.cpu_ticks.2)
+        let nice = Double(info.cpu_ticks.3)
+
+        let current = (user: user, system: system, idle: idle, nice: nice)
+
+        guard let previous = previousCPUTicks else {
+            previousCPUTicks = current
+            return "—"
+        }
+
+        let userDiff = current.user - previous.user
+        let systemDiff = current.system - previous.system
+        let idleDiff = current.idle - previous.idle
+        let niceDiff = current.nice - previous.nice
+
+        let totalTicks = userDiff + systemDiff + idleDiff + niceDiff
+        guard totalTicks > 0 else { return "—" }
+
+        let busyTicks = userDiff + systemDiff + niceDiff
+        let percent = (busyTicks / totalTicks) * 100
+
+        previousCPUTicks = current
+        return String(format: "%.0f%%", percent)
     }
 
     private static func format(bytes: Int64) -> String {
@@ -88,5 +152,3 @@ enum SystemInfoProvider {
         return components.joined(separator: " ")
     }
 }
-
-

@@ -19,7 +19,10 @@ struct SystemInfoProviderTimeline: TimelineProvider {
             macOSVersion: "macOS 15.0",
             memoryUsage: "8.0 / 16.0 GB",
             uptime: "1d 2h 30m",
-            freeDiskSpace: "256.0 GB"
+            freeDiskSpace: "256.0 GB",
+            cpuUsage: "25%",
+            totalDiskSpace: "500.0 GB",
+            diskUsagePercent: 0.5
         ))
     }
 
@@ -109,18 +112,17 @@ struct WidgetStatRow: View {
 struct SmallWidgetView: View {
     let entry: SystemInfoEntry
     
-    private var memoryValue: Double {
-        let parts = entry.snapshot.memoryUsage.components(separatedBy: " / ")
-        if parts.count == 2,
-           let used = Double(parts[0]),
-           let total = Double(parts[1].replacingOccurrences(of: " GB", with: "")) {
-            return used / total
-        }
-        return 0.5
+    private var cpuValue: Double {
+        let cleaned = entry.snapshot.cpuUsage.replacingOccurrences(of: "%", with: "")
+        return (Double(cleaned) ?? 0) / 100.0
+    }
+    
+    private var diskPercent: String {
+        String(format: "%.0f%%", entry.snapshot.diskUsagePercent * 100)
     }
     
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             // Header
             HStack(spacing: 6) {
                 ZStack {
@@ -132,22 +134,22 @@ struct SmallWidgetView: View {
                                 endPoint: .bottomTrailing
                             )
                         )
-                        .frame(width: 22, height: 22)
+                        .frame(width: 20, height: 20)
                     
                     Image(systemName: "gauge.with.dots.needle.67percent")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(.white)
                 }
                 
                 VStack(alignment: .leading, spacing: 0) {
                     Text("System")
-                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
                     HStack(spacing: 3) {
                         Circle()
                             .fill(.green)
                             .frame(width: 4, height: 4)
                         Text("Live")
-                            .font(.system(size: 8))
+                            .font(.system(size: 7))
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -155,20 +157,25 @@ struct SmallWidgetView: View {
                 Spacer()
             }
             
-            Spacer(minLength: 2)
-            
-            // Memory gauge centered
-            WidgetMiniGauge(
-                value: memoryValue,
-                icon: "memorychip",
-                label: "Memory",
-                colors: [.purple, .pink]
-            )
-            
-            Spacer(minLength: 2)
+            // Two gauges side by side
+            HStack(spacing: 12) {
+                WidgetMiniGauge(
+                    value: cpuValue,
+                    icon: "cpu",
+                    label: entry.snapshot.cpuUsage,
+                    colors: [.blue, .cyan]
+                )
+                
+                WidgetMiniGauge(
+                    value: entry.snapshot.diskUsagePercent,
+                    icon: "internaldrive",
+                    label: diskPercent,
+                    colors: [.orange, .yellow]
+                )
+            }
             
             // Quick stats
-            VStack(spacing: 3) {
+            VStack(spacing: 2) {
                 WidgetStatRow(
                     icon: "clock.arrow.circlepath",
                     label: "Up",
@@ -176,14 +183,14 @@ struct SmallWidgetView: View {
                     iconColor: .teal
                 )
                 WidgetStatRow(
-                    icon: "internaldrive",
+                    icon: "internaldrive.fill",
                     label: "Free",
                     value: entry.snapshot.freeDiskSpace,
-                    iconColor: .orange
+                    iconColor: .green
                 )
             }
         }
-        .padding(12)
+        .padding(10)
     }
 }
 
@@ -192,18 +199,13 @@ struct SmallWidgetView: View {
 struct MediumWidgetView: View {
     let entry: SystemInfoEntry
     
-    private var memoryValue: Double {
-        let parts = entry.snapshot.memoryUsage.components(separatedBy: " / ")
-        if parts.count == 2,
-           let used = Double(parts[0]),
-           let total = Double(parts[1].replacingOccurrences(of: " GB", with: "")) {
-            return used / total
-        }
-        return 0.5
+    private var cpuValue: Double {
+        let cleaned = entry.snapshot.cpuUsage.replacingOccurrences(of: "%", with: "")
+        return (Double(cleaned) ?? 0) / 100.0
     }
     
-    private var memoryPercent: String {
-        String(format: "%.0f%%", memoryValue * 100)
+    private var diskPercent: String {
+        String(format: "%.0f%%", entry.snapshot.diskUsagePercent * 100)
     }
     
     var body: some View {
@@ -244,19 +246,19 @@ struct MediumWidgetView: View {
                 
                 Spacer()
                 
-                // Gauges row
+                // Gauges row - CPU and Disk
                 HStack(spacing: 16) {
                     WidgetMiniGauge(
-                        value: memoryValue,
-                        icon: "memorychip",
-                        label: memoryPercent,
-                        colors: [.purple, .pink]
+                        value: cpuValue,
+                        icon: "cpu",
+                        label: entry.snapshot.cpuUsage,
+                        colors: [.blue, .cyan]
                     )
                     
                     WidgetMiniGauge(
-                        value: 0.7, // Placeholder for disk usage
+                        value: entry.snapshot.diskUsagePercent,
                         icon: "internaldrive",
-                        label: "Disk",
+                        label: diskPercent,
                         colors: [.orange, .yellow]
                     )
                 }
@@ -278,10 +280,10 @@ struct MediumWidgetView: View {
                 
                 VStack(spacing: 5) {
                     WidgetStatRow(
-                        icon: "memorychip",
-                        label: "Memory",
-                        value: entry.snapshot.memoryUsage,
-                        iconColor: .purple
+                        icon: "cpu",
+                        label: "CPU",
+                        value: entry.snapshot.cpuUsage,
+                        iconColor: .blue
                     )
                     
                     WidgetStatRow(
@@ -292,9 +294,16 @@ struct MediumWidgetView: View {
                     )
                     
                     WidgetStatRow(
-                        icon: "internaldrive",
-                        label: "Disk Free",
+                        icon: "internaldrive.fill",
+                        label: "Free",
                         value: entry.snapshot.freeDiskSpace,
+                        iconColor: .green
+                    )
+                    
+                    WidgetStatRow(
+                        icon: "internaldrive",
+                        label: "Total",
+                        value: entry.snapshot.totalDiskSpace,
                         iconColor: .orange
                     )
                 }
