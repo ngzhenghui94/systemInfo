@@ -12,6 +12,5 @@ import SwiftUI
 struct SystemInfoWidgetBundle: WidgetBundle {
     var body: some Widget {
         SystemInfoWidget()
-        SystemInfoWidgetControl()
     }
 }

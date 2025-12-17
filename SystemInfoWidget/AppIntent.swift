@@ -8,11 +8,8 @@
 import WidgetKit
 import AppIntents
 
+/// No configuration needed for now, but you can extend this later if you want options.
 struct ConfigurationAppIntent: WidgetConfigurationIntent {
-    static var title: LocalizedStringResource { "Configuration" }
-    static var description: IntentDescription { "This is an example widget." }
-
-    // An example configurable parameter.
-    @Parameter(title: "Favorite Emoji", default: "😃")
-    var favoriteEmoji: String
+    static var title: LocalizedStringResource { "Mac System Info" }
+    static var description: IntentDescription { "Shows basic system information." }
 }
