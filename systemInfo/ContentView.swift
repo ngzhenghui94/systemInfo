@@ -24,6 +24,21 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var freeDiskSpace: String = ""
     @Published var downloadSpeed: String = "—"
     @Published var uploadSpeed: String = "—"
+    
+    // New stats
+    @Published var cpuModel: String = ""
+    @Published var cpuCores: String = ""
+    @Published var gpuName: String = ""
+    @Published var thermalState: String = ""
+    @Published var totalDiskSpace: String = ""
+    @Published var diskUsagePercent: Double = 0
+    @Published var ipAddress: String = ""
+    @Published var wifiNetwork: String = ""
+    @Published var processCount: String = ""
+    @Published var batteryHealth: String = ""
+    @Published var batteryTemperature: String = ""
+    @Published var batteryCycleCount: String = ""
+    @Published var memoryPressure: String = ""
 
     private let networkMonitor = NetworkMonitor()
     private var timer: Timer?
@@ -46,6 +61,13 @@ final class SystemInfoViewModel: ObservableObject {
         freeDiskSpace = Self.format(bytes: getFreeDiskSpaceBytes())
         memoryUsage = Self.memoryUsageSummary()
         updatePowerInfo()
+        
+        // New static info
+        cpuModel = Self.getCPUModel()
+        cpuCores = Self.getCPUCores()
+        gpuName = Self.getGPUName()
+        totalDiskSpace = Self.format(bytes: getTotalDiskSpaceBytes())
+        updateDiskUsage()
     }
 
     /// Info that should refresh regularly (uptime, network speeds).
@@ -71,6 +93,23 @@ final class SystemInfoViewModel: ObservableObject {
         let speeds = networkMonitor.currentSpeeds()
         downloadSpeed = Self.format(bytesPerSecond: speeds.download)
         uploadSpeed = Self.format(bytesPerSecond: speeds.upload)
+        
+        // New dynamic info
+        thermalState = Self.getThermalState()
+        ipAddress = Self.getIPAddress()
+        wifiNetwork = Self.getWiFiSSID()
+        processCount = Self.getProcessCount()
+        memoryPressure = Self.getMemoryPressure()
+        updateDiskUsage()
+    }
+    
+    private func updateDiskUsage() {
+        let total = getTotalDiskSpaceBytes()
+        let free = getFreeDiskSpaceBytes()
+        if total > 0 {
+            diskUsagePercent = Double(total - free) / Double(total)
+        }
+        freeDiskSpace = Self.format(bytes: free)
     }
 
     private func getFreeDiskSpaceBytes() -> Int64 {
@@ -255,6 +294,190 @@ final class SystemInfoViewModel: ObservableObject {
         if hours > 0 || !components.isEmpty { components.append("\(hours)h") }
         components.append("\(minutes)m")
         return components.joined(separator: " ")
+    }
+    
+    // MARK: - New Stat Methods
+    
+    private func getTotalDiskSpaceBytes() -> Int64 {
+        let url = URL(fileURLWithPath: "/")
+        if let values = try? url.resourceValues(forKeys: [.volumeTotalCapacityKey]),
+           let capacity = values.volumeTotalCapacity {
+            return Int64(capacity)
+        }
+        return 0
+    }
+    
+    private static func getCPUModel() -> String {
+        var size = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+        var buffer = [CChar](repeating: 0, count: size)
+        sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0)
+        let model = String(cString: buffer)
+        // Shorten common prefixes
+        return model
+            .replacingOccurrences(of: "Intel(R) Core(TM) ", with: "")
+            .replacingOccurrences(of: "Apple ", with: "")
+            .trimmingCharacters(in: .whitespaces)
+    }
+    
+    private static func getCPUCores() -> String {
+        let physical = ProcessInfo.processInfo.processorCount
+        var logical = 0
+        var size = MemoryLayout<Int>.size
+        sysctlbyname("hw.logicalcpu", &logical, &size, nil, 0)
+        if logical > 0 && logical != physical {
+            return "\(physical)P / \(logical)L"
+        }
+        return "\(physical) cores"
+    }
+    
+    private static func getGPUName() -> String {
+        // Use IOKit to get GPU info
+        let matchDict = IOServiceMatching("IOPCIDevice")
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matchDict, &iterator) == KERN_SUCCESS else {
+            return "—"
+        }
+        defer { IOObjectRelease(iterator) }
+        
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            defer { 
+                IOObjectRelease(service)
+                service = IOIteratorNext(iterator)
+            }
+            
+            if let modelData = IORegistryEntryCreateCFProperty(service, "model" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Data {
+                if let model = String(data: modelData, encoding: .utf8)?.trimmingCharacters(in: .controlCharacters) {
+                    if model.contains("GPU") || model.contains("Graphics") || model.contains("M1") || model.contains("M2") || model.contains("M3") || model.contains("M4") {
+                        return model
+                    }
+                }
+            }
+        }
+        
+        // Fallback for Apple Silicon
+        #if arch(arm64)
+        return "Apple GPU"
+        #else
+        return "—"
+        #endif
+    }
+    
+    private static func getThermalState() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:
+            return "Normal"
+        case .fair:
+            return "Fair"
+        case .serious:
+            return "Serious"
+        case .critical:
+            return "Critical"
+        @unknown default:
+            return "Unknown"
+        }
+    }
+    
+    private static func getIPAddress() -> String {
+        var address = "—"
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
+            return address
+        }
+        defer { freeifaddrs(ifaddr) }
+        
+        var ptr = firstAddr
+        while true {
+            let interface = ptr.pointee
+            let addrFamily = interface.ifa_addr.pointee.sa_family
+            
+            if addrFamily == UInt8(AF_INET) { // IPv4
+                let name = String(cString: interface.ifa_name)
+                if name == "en0" || name == "en1" { // Wi-Fi or Ethernet
+                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                               &hostname, socklen_t(hostname.count),
+                               nil, 0, NI_NUMERICHOST)
+                    address = String(cString: hostname)
+                    break
+                }
+            }
+            
+            guard let next = interface.ifa_next else { break }
+            ptr = next
+        }
+        
+        return address
+    }
+    
+    private static func getWiFiSSID() -> String {
+        // On macOS, we can use CoreWLAN but it requires the CoreWLAN framework
+        // For now, return a placeholder or use a simpler approach
+        let task = Process()
+        task.launchPath = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+        task.arguments = ["-I"]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8) {
+                for line in output.components(separatedBy: "\n") {
+                    if line.contains("SSID:") && !line.contains("BSSID") {
+                        let parts = line.components(separatedBy: ":")
+                        if parts.count >= 2 {
+                            return parts[1].trimmingCharacters(in: .whitespaces)
+                        }
+                    }
+                }
+            }
+        } catch {
+            return "—"
+        }
+        
+        return "Not connected"
+    }
+    
+    private static func getProcessCount() -> String {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size = 0
+        sysctl(&mib, UInt32(mib.count), nil, &size, nil, 0)
+        let count = size / MemoryLayout<kinfo_proc>.size
+        return "\(count)"
+    }
+    
+    private static func getMemoryPressure() -> String {
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout.size(ofValue: stats) / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &stats) { ptr -> kern_return_t in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, intPtr, &count)
+            }
+        }
+        
+        guard result == KERN_SUCCESS else { return "—" }
+        
+        var pageSize: vm_size_t = 0
+        host_page_size(mach_host_self(), &pageSize)
+        
+        let total = Double(ProcessInfo.processInfo.physicalMemory)
+        let compressed = Double(stats.compressor_page_count) * Double(pageSize)
+        let compressedPercent = (compressed / total) * 100
+        
+        if compressedPercent < 10 {
+            return "Low"
+        } else if compressedPercent < 30 {
+            return "Medium"
+        } else {
+            return "High"
+        }
     }
 }
 
@@ -552,126 +775,304 @@ struct ContentView: View {
         }
     }
     
-    var body: some View {
-        VStack(spacing: 16) {
-            // Header
-            HStack(spacing: 10) {
-                ZStack {
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [.blue, .purple],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .frame(width: 36, height: 36)
-                    
-                    Image(systemName: "gauge.with.dots.needle.67percent")
-                        .font(.system(size: 18, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
-                
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("System Monitor")
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                    
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(.green)
-                            .frame(width: 6, height: 6)
-                        Text("Live • \(viewModel.hostName)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                
-                Spacer()
-                
-                Text(viewModel.macOSVersion)
-                    .font(.caption)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background {
-                        Capsule()
-                            .fill(Color.blue.opacity(0.15))
-                    }
-                    .foregroundStyle(.blue)
-            }
-            
-            // Gauges Section
-            GlassCard {
-                HStack(spacing: 20) {
-                    CircularGaugeView(
-                        value: cpuValue,
-                        label: "CPU",
-                        valueText: viewModel.cpuUsage,
-                        icon: "cpu",
-                        gradientColors: [.blue, .cyan]
-                    )
-                    
-                    CircularGaugeView(
-                        value: memoryValue,
-                        label: "Memory",
-                        valueText: memoryPercent,
-                        icon: "memorychip",
-                        gradientColors: [.purple, .pink]
-                    )
-                    
-                    CircularGaugeView(
-                        value: batteryValue,
-                        label: "Battery",
-                        valueText: viewModel.batteryLevel,
-                        icon: "battery.100",
-                        gradientColors: batteryGradient
-                    )
-                }
-                .frame(maxWidth: .infinity)
-            }
-            
-            // System Details
-            GlassCard {
-                VStack(spacing: 4) {
-                    StatRow(
-                        icon: "waveform.path.ecg",
-                        label: "Load Average",
-                        value: viewModel.loadAverage,
-                        iconColor: .indigo
-                    )
-                    
-                    StatRow(
-                        icon: "clock.arrow.circlepath",
-                        label: "Uptime",
-                        value: viewModel.uptime,
-                        iconColor: .teal
-                    )
-                    
-                    StatRow(
-                        icon: "internaldrive",
-                        label: "Disk Free",
-                        value: viewModel.freeDiskSpace,
-                        iconColor: .orange
-                    )
-                    
-                    StatRow(
-                        icon: "bolt.fill",
-                        label: "Power Source",
-                        value: "\(viewModel.powerSource) • \(viewModel.chargingWattage)",
-                        iconColor: .yellow
-                    )
-                }
-            }
-            
-            // Network Section
-            GlassCard {
-                NetworkSpeedBar(
-                    downloadSpeed: viewModel.downloadSpeed,
-                    uploadSpeed: viewModel.uploadSpeed
-                )
-            }
+    private var diskPercent: String {
+        String(format: "%.0f%%", viewModel.diskUsagePercent * 100)
+    }
+    
+    private var thermalColor: Color {
+        switch viewModel.thermalState {
+        case "Normal": return .green
+        case "Fair": return .yellow
+        case "Serious": return .orange
+        case "Critical": return .red
+        default: return .gray
         }
-        .padding(20)
-        .frame(width: 360)
+    }
+    
+    private var pressureColor: Color {
+        switch viewModel.memoryPressure {
+        case "Low": return .green
+        case "Medium": return .yellow
+        case "High": return .red
+        default: return .gray
+        }
+    }
+    
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 14) {
+                // Header
+                HStack(spacing: 10) {
+                    ZStack {
+                        Circle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [.blue, .purple],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .frame(width: 36, height: 36)
+                        
+                        Image(systemName: "gauge.with.dots.needle.67percent")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(.white)
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("System Monitor")
+                            .font(.system(size: 16, weight: .bold, design: .rounded))
+                        
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(.green)
+                                .frame(width: 6, height: 6)
+                            Text("Live • \(viewModel.hostName)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    
+                    Spacer()
+                    
+                    Text(viewModel.macOSVersion)
+                        .font(.caption)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background {
+                            Capsule()
+                                .fill(Color.blue.opacity(0.15))
+                        }
+                        .foregroundStyle(.blue)
+                }
+                
+                // Main Gauges Section
+                GlassCard {
+                    HStack(spacing: 16) {
+                        CircularGaugeView(
+                            value: cpuValue,
+                            label: "CPU",
+                            valueText: viewModel.cpuUsage,
+                            icon: "cpu",
+                            gradientColors: [.blue, .cyan]
+                        )
+                        
+                        CircularGaugeView(
+                            value: memoryValue,
+                            label: "Memory",
+                            valueText: memoryPercent,
+                            icon: "memorychip",
+                            gradientColors: [.purple, .pink]
+                        )
+                        
+                        CircularGaugeView(
+                            value: viewModel.diskUsagePercent,
+                            label: "Disk",
+                            valueText: diskPercent,
+                            icon: "internaldrive",
+                            gradientColors: [.orange, .yellow]
+                        )
+                        
+                        CircularGaugeView(
+                            value: batteryValue,
+                            label: "Battery",
+                            valueText: viewModel.batteryLevel,
+                            icon: "battery.100",
+                            gradientColors: batteryGradient
+                        )
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                
+                // Hardware Section
+                GlassCard {
+                    VStack(spacing: 4) {
+                        HStack {
+                            Text("Hardware")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(.bottom, 4)
+                        
+                        StatRow(
+                            icon: "cpu",
+                            label: "Processor",
+                            value: viewModel.cpuModel,
+                            iconColor: .blue
+                        )
+                        
+                        StatRow(
+                            icon: "square.grid.2x2",
+                            label: "Cores",
+                            value: viewModel.cpuCores,
+                            iconColor: .cyan
+                        )
+                        
+                        StatRow(
+                            icon: "gpu",
+                            label: "Graphics",
+                            value: viewModel.gpuName,
+                            iconColor: .mint
+                        )
+                    }
+                }
+                
+                // System Details
+                GlassCard {
+                    VStack(spacing: 4) {
+                        HStack {
+                            Text("System")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(.bottom, 4)
+                        
+                        StatRow(
+                            icon: "waveform.path.ecg",
+                            label: "Load Average",
+                            value: viewModel.loadAverage,
+                            iconColor: .indigo
+                        )
+                        
+                        StatRow(
+                            icon: "clock.arrow.circlepath",
+                            label: "Uptime",
+                            value: viewModel.uptime,
+                            iconColor: .teal
+                        )
+                        
+                        StatRow(
+                            icon: "gearshape.2",
+                            label: "Processes",
+                            value: viewModel.processCount,
+                            iconColor: .gray
+                        )
+                        
+                        StatRow(
+                            icon: "thermometer.medium",
+                            label: "Thermal State",
+                            value: viewModel.thermalState,
+                            iconColor: thermalColor
+                        )
+                        
+                        StatRow(
+                            icon: "gauge.with.needle",
+                            label: "Memory Pressure",
+                            value: viewModel.memoryPressure,
+                            iconColor: pressureColor
+                        )
+                    }
+                }
+                
+                // Storage Section
+                GlassCard {
+                    VStack(spacing: 4) {
+                        HStack {
+                            Text("Storage")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(.bottom, 4)
+                        
+                        StatRow(
+                            icon: "internaldrive",
+                            label: "Total Space",
+                            value: viewModel.totalDiskSpace,
+                            iconColor: .orange
+                        )
+                        
+                        StatRow(
+                            icon: "internaldrive.fill",
+                            label: "Free Space",
+                            value: viewModel.freeDiskSpace,
+                            iconColor: .green
+                        )
+                        
+                        StatRow(
+                            icon: "chart.pie",
+                            label: "Used",
+                            value: diskPercent,
+                            iconColor: .red
+                        )
+                    }
+                }
+                
+                // Power Section
+                GlassCard {
+                    VStack(spacing: 4) {
+                        HStack {
+                            Text("Power")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(.bottom, 4)
+                        
+                        StatRow(
+                            icon: "battery.100",
+                            label: "Battery Level",
+                            value: viewModel.batteryLevel,
+                            iconColor: batteryGradient.first ?? .green
+                        )
+                        
+                        StatRow(
+                            icon: "powerplug",
+                            label: "Power Source",
+                            value: viewModel.powerSource,
+                            iconColor: .yellow
+                        )
+                        
+                        StatRow(
+                            icon: "bolt.fill",
+                            label: "Charge Rate",
+                            value: viewModel.chargingWattage,
+                            iconColor: .orange
+                        )
+                    }
+                }
+                
+                // Network Section
+                GlassCard {
+                    VStack(spacing: 8) {
+                        HStack {
+                            Text("Network")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        
+                        HStack(spacing: 4) {
+                            StatRow(
+                                icon: "wifi",
+                                label: "Wi-Fi",
+                                value: viewModel.wifiNetwork,
+                                iconColor: .blue
+                            )
+                        }
+                        
+                        StatRow(
+                            icon: "network",
+                            label: "IP Address",
+                            value: viewModel.ipAddress,
+                            iconColor: .purple
+                        )
+                        
+                        Divider()
+                            .padding(.vertical, 4)
+                        
+                        NetworkSpeedBar(
+                            downloadSpeed: viewModel.downloadSpeed,
+                            uploadSpeed: viewModel.uploadSpeed
+                        )
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .frame(width: 380, height: 600)
         .background {
             // Subtle gradient background
             LinearGradient(
