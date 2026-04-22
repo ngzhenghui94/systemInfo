@@ -31,7 +31,9 @@ private func makeSample(
     downloadBytesPerSecond: Double,
     uploadBytesPerSecond: Double,
     thermalState: String = "Normal",
-    powerSource: String = "Battery"
+    powerSource: String = "Battery",
+    powerMetricKind: PowerMetricKind? = .systemPower,
+    powerMetricSource: String? = "AppleSmartBattery/BatteryData.SystemPower"
 ) -> SystemHistorySample {
     SystemHistorySample(
         capturedAt: capturedAt,
@@ -53,6 +55,8 @@ private func makeSample(
         powerSource: powerSource,
         powerUsageText: String(format: "%.1f W", powerUsageWatts),
         powerUsageWatts: powerUsageWatts,
+        powerMetricKind: powerMetricKind,
+        powerMetricSource: powerMetricSource,
         chargingWattageText: "—",
         uptimeText: "2h 15m",
         uptimeSeconds: 8_100,
@@ -76,6 +80,7 @@ private func makeSample(
 struct MonitoringHistoryTests {
     static func main() throws {
         try testReportSummarizesPowerUsageAndCoverage()
+        try testReportExcludesLegacyUnscopedPowerSamples()
         try testStorePrunesToRetentionLimit()
         print("Monitoring history tests passed")
     }
@@ -127,9 +132,51 @@ struct MonitoringHistoryTests {
         expect(report.contains("# System Monitoring Report"), "report header missing")
         expect(report.contains("Samples stored: 3"), "sample count missing")
         expect(report.contains("Coverage: 2h 0m"), "coverage summary missing")
-        expect(report.contains("Power usage: avg 11.0 W, min 8.0 W, max 14.0 W, latest 11.0 W"), "power usage summary incorrect")
+        expect(report.contains("System power: avg 11.0 W, min 8.0 W, max 14.0 W, latest 11.0 W"), "system power summary incorrect")
         expect(report.contains("Thermal states observed: Fair (1), Normal (2)"), "thermal state aggregation incorrect")
         expect(report.contains("Power sources observed: AC Power (1), Battery (2)"), "power source aggregation incorrect")
+    }
+
+    private static func testReportExcludesLegacyUnscopedPowerSamples() throws {
+        let samples = [
+            makeSample(
+                capturedAt: makeDate(2026, 4, 22, 0, 0),
+                cpuUsagePercent: 10,
+                memoryUsedGB: 8,
+                memoryTotalGB: 16,
+                batteryLevelPercent: 90,
+                powerUsageWatts: 18,
+                freeDiskBytes: 300 * 1_024 * 1_024 * 1_024,
+                totalDiskBytes: 512 * 1_024 * 1_024 * 1_024,
+                downloadBytesPerSecond: 0,
+                uploadBytesPerSecond: 0,
+                powerMetricKind: nil,
+                powerMetricSource: nil
+            ),
+            makeSample(
+                capturedAt: makeDate(2026, 4, 22, 1, 0),
+                cpuUsagePercent: 14,
+                memoryUsedGB: 8.5,
+                memoryTotalGB: 16,
+                batteryLevelPercent: 88,
+                powerUsageWatts: 10,
+                freeDiskBytes: 299 * 1_024 * 1_024 * 1_024,
+                totalDiskBytes: 512 * 1_024 * 1_024 * 1_024,
+                downloadBytesPerSecond: 0,
+                uploadBytesPerSecond: 0
+            )
+        ]
+
+        let report = SystemReportGenerator.generate(from: samples, generatedAt: makeDate(2026, 4, 22, 2, 0))
+
+        expect(
+            report.contains("System power: avg 10.0 W, min 10.0 W, max 10.0 W, latest 10.0 W"),
+            "legacy unscoped power samples should be excluded from the system-power trend"
+        )
+        expect(
+            report.contains("Legacy or unscoped power samples excluded from system-power trend: 1"),
+            "report should call out excluded legacy power samples"
+        )
     }
 
     private static func testStorePrunesToRetentionLimit() throws {

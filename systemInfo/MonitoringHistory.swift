@@ -20,6 +20,8 @@ struct SystemHistorySample: Codable, Equatable {
     let powerSource: String
     let powerUsageText: String
     let powerUsageWatts: Double?
+    let powerMetricKind: PowerMetricKind?
+    let powerMetricSource: String?
     let chargingWattageText: String
     let uptimeText: String
     let uptimeSeconds: TimeInterval?
@@ -213,16 +215,22 @@ enum SystemReportGenerator {
             "- GPU: \(latestSample.gpuName)",
             "- Uptime: \(latestSample.uptimeText)",
             "- Thermal state: \(latestSample.thermalState)",
-            "- Power source: \(latestSample.powerSource)",
-            "- Power usage: \(latestSample.powerUsageText)",
-            "- Battery level: \(latestSample.batteryLevelText)",
-            "- Free memory: \(latestSample.freeMemoryText)",
-            "- Disk free: \(latestSample.freeDiskSpaceText) of \(latestSample.totalDiskSpaceText)",
-            "- Wi-Fi: \(latestSample.wifiNetwork)",
-            "- IP address: \(latestSample.ipAddress)",
-            "",
-            "## Resource Trends"
+            "- Power source: \(latestSample.powerSource)"
         ]
+
+        if let powerMetricSource = latestSample.powerMetricSource,
+           latestSample.powerMetricKind == .systemPower {
+            lines.append("- System power source: \(powerMetricSource)")
+        }
+
+        lines.append("- System power: \(latestSample.powerUsageText)")
+        lines.append("- Battery level: \(latestSample.batteryLevelText)")
+        lines.append("- Free memory: \(latestSample.freeMemoryText)")
+        lines.append("- Disk free: \(latestSample.freeDiskSpaceText) of \(latestSample.totalDiskSpaceText)")
+        lines.append("- Wi-Fi: \(latestSample.wifiNetwork)")
+        lines.append("- IP address: \(latestSample.ipAddress)")
+        lines.append("")
+        lines.append("## Resource Trends")
 
         if let summary = summarize(sortedSamples.compactMap(\.cpuUsagePercent)) {
             lines.append("- CPU usage: \(formatPercentageSummary(summary))")
@@ -236,8 +244,17 @@ enum SystemReportGenerator {
         if let summary = summarize(sortedSamples.compactMap(\.batteryLevelPercent)) {
             lines.append("- Battery level: \(formatPercentageSummary(summary))")
         }
-        if let summary = summarize(sortedSamples.compactMap(\.powerUsageWatts)) {
-            lines.append("- Power usage: \(formatWattSummary(summary))")
+        let scopedSystemPowerSamples = sortedSamples.filter { $0.powerMetricKind == .systemPower }
+        if let summary = summarize(scopedSystemPowerSamples.compactMap(\.powerUsageWatts)) {
+            lines.append("- System power: \(formatWattSummary(summary))")
+        }
+        // Historical reports may contain legacy battery-flow samples from before
+        // the metric was scoped. Exclude them so new system-power trends stay honest.
+        let excludedLegacyPowerSampleCount = sortedSamples.filter {
+            $0.powerUsageWatts != nil && $0.powerMetricKind != .systemPower
+        }.count
+        if excludedLegacyPowerSampleCount > 0 {
+            lines.append("- Legacy or unscoped power samples excluded from system-power trend: \(excludedLegacyPowerSampleCount)")
         }
         if let summary = summarize(sortedSamples.compactMap(\.downloadBytesPerSecond)) {
             lines.append("- Download throughput: \(formatTransferSummary(summary))")

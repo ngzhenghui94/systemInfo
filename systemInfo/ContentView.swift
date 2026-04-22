@@ -9,7 +9,6 @@ import SwiftUI
 import Combine
 import Darwin
 import AppKit
-import IOKit.ps
 
 /// View model that gathers and formats system information for display.
 final class SystemInfoViewModel: ObservableObject {
@@ -21,7 +20,7 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var batteryLevel: String = ""
     @Published var powerSource: String = ""
     @Published var powerUsage: String = "—"
-    @Published var chargingWattage: String = ""
+    @Published var chargingWattage: String = "—"
     @Published var uptime: String = ""
     @Published var freeDiskSpace: String = ""
     @Published var downloadSpeed: String = "—"
@@ -52,6 +51,7 @@ final class SystemInfoViewModel: ObservableObject {
     private var lastPersistedAt: Date?
     private var latestDownloadBytesPerSecond: Double = 0
     private var latestUploadBytesPerSecond: Double = 0
+    private var currentPowerSnapshot: PowerTelemetrySnapshot = .unavailable
 
     private let historySaveInterval: TimeInterval = 60
 
@@ -113,8 +113,8 @@ final class SystemInfoViewModel: ObservableObject {
         
         // New dynamic info
         thermalState = Self.getThermalState()
-        ipAddress = Self.getIPAddress()
-        wifiNetwork = Self.getWiFiSSID()
+        ipAddress = NetworkDetailsResolver.currentIPv4Address()
+        wifiNetwork = NetworkDetailsResolver.currentWiFiSSID()
         freeMemory = Self.getFreeMemory()
         updateDiskUsage()
         persistHistoryIfNeeded(capturedAt: now, force: forcePersist)
@@ -167,11 +167,12 @@ final class SystemInfoViewModel: ObservableObject {
     }
 
     private func updatePowerInfo() {
-        let info = Self.batteryInfo()
-        batteryLevel = info.level
-        powerSource = info.source
-        powerUsage = info.usage
-        chargingWattage = info.chargeRate
+        let snapshot = PowerTelemetryResolver.currentSnapshot()
+        currentPowerSnapshot = snapshot
+        batteryLevel = snapshot.batteryLevelText
+        powerSource = snapshot.powerSource
+        powerUsage = snapshot.systemPowerText
+        chargingWattage = snapshot.chargeRateText
     }
 
     // Track last CPU ticks so we can compute a delta-based usage percentage.
@@ -222,64 +223,6 @@ final class SystemInfoViewModel: ObservableObject {
         guard count >= 2 else { return "—" }
         // Show 1‑ and 5‑minute averages.
         return String(format: "%.2f, %.2f", loads[0], loads[1])
-    }
-
-    private static func batteryInfo() -> (level: String, source: String, usage: String, chargeRate: String) {
-        guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let list = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef],
-              !list.isEmpty else {
-            return ("—", "No battery", "—", "—")
-        }
-
-        for ps in list {
-            guard let description = IOPSGetPowerSourceDescription(snapshot, ps)?
-                .takeUnretainedValue() as? [String: Any],
-                  let type = description[kIOPSTypeKey as String] as? String,
-                  type == kIOPSInternalBatteryType as String
-            else { continue }
-
-            // Battery percentage
-            var levelString = "—"
-            if let current = description[kIOPSCurrentCapacityKey as String] as? Double,
-               let max = description[kIOPSMaxCapacityKey as String] as? Double,
-               max > 0 {
-                let pct = (current / max) * 100
-                levelString = String(format: "%.0f%%", pct)
-            }
-
-            // Power source (AC vs Battery)
-            let state = description[kIOPSPowerSourceStateKey as String] as? String
-            let sourceString: String
-            if state == kIOPSACPowerValue {
-                sourceString = "AC Power"
-            } else if state == kIOPSBatteryPowerValue {
-                sourceString = "Battery"
-            } else {
-                sourceString = state ?? "Unknown"
-            }
-
-            // Estimate current battery power flow from the reported voltage/current pair.
-            var usageString = "—"
-            var chargeRateString = "—"
-            if let voltage = description[kIOPSVoltageKey as String] as? Double,
-               let currentMA = description[kIOPSCurrentKey as String] as? Double {
-                // Voltage is in mV and current is in mA, so dividing by 1_000_000
-                // yields watts. We expose it as the live power usage signal and,
-                // when charging, also as the charge rate.
-                let watts = abs(voltage * currentMA) / 1_000_000.0
-                if watts > 0.1 {
-                    usageString = String(format: "%.1f W", watts)
-                    let isCharging = description[kIOPSIsChargingKey as String] as? Bool ?? false
-                    if isCharging {
-                        chargeRateString = usageString
-                    }
-                }
-            }
-
-            return (levelString, sourceString, usageString, chargeRateString)
-        }
-
-        return ("—", "No battery", "—", "—")
     }
 
     // MARK: - Formatting helpers
@@ -404,72 +347,6 @@ final class SystemInfoViewModel: ObservableObject {
         }
     }
     
-    private static func getIPAddress() -> String {
-        var address = "—"
-        var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
-            return address
-        }
-        defer { freeifaddrs(ifaddr) }
-        
-        var ptr = firstAddr
-        while true {
-            let interface = ptr.pointee
-            let addrFamily = interface.ifa_addr.pointee.sa_family
-            
-            if addrFamily == UInt8(AF_INET) { // IPv4
-                let name = String(cString: interface.ifa_name)
-                if name == "en0" || name == "en1" { // Wi-Fi or Ethernet
-                    var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                    getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
-                               &hostname, socklen_t(hostname.count),
-                               nil, 0, NI_NUMERICHOST)
-                    address = String(cString: hostname)
-                    break
-                }
-            }
-            
-            guard let next = interface.ifa_next else { break }
-            ptr = next
-        }
-        
-        return address
-    }
-    
-    private static func getWiFiSSID() -> String {
-        // On macOS, we can use CoreWLAN but it requires the CoreWLAN framework
-        // For now, return a placeholder or use a simpler approach
-        let task = Process()
-        task.launchPath = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
-        task.arguments = ["-I"]
-        
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        
-        do {
-            try task.run()
-            task.waitUntilExit()
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                for line in output.components(separatedBy: "\n") {
-                    if line.contains("SSID:") && !line.contains("BSSID") {
-                        let parts = line.components(separatedBy: ":")
-                        if parts.count >= 2 {
-                            return parts[1].trimmingCharacters(in: .whitespaces)
-                        }
-                    }
-                }
-            }
-        } catch {
-            return "—"
-        }
-        
-        return "Not connected"
-    }
-    
     private static func getFreeMemory() -> String {
         var stats = vm_statistics64()
         var count = mach_msg_type_number_t(MemoryLayout.size(ofValue: stats) / MemoryLayout<integer_t>.size)
@@ -561,12 +438,14 @@ final class SystemInfoViewModel: ObservableObject {
             memoryUsageText: memoryUsage,
             memoryUsedGB: memoryParts.used,
             memoryTotalGB: memoryParts.total,
-            batteryLevelText: batteryLevel,
-            batteryLevelPercent: Self.parsePercent(from: batteryLevel),
-            powerSource: powerSource,
-            powerUsageText: powerUsage,
-            powerUsageWatts: Self.parseWatts(from: powerUsage),
-            chargingWattageText: chargingWattage,
+            batteryLevelText: currentPowerSnapshot.batteryLevelText,
+            batteryLevelPercent: Self.parsePercent(from: currentPowerSnapshot.batteryLevelText),
+            powerSource: currentPowerSnapshot.powerSource,
+            powerUsageText: currentPowerSnapshot.systemPowerText,
+            powerUsageWatts: currentPowerSnapshot.systemPowerWatts,
+            powerMetricKind: currentPowerSnapshot.powerMetricKind,
+            powerMetricSource: currentPowerSnapshot.powerMetricSource,
+            chargingWattageText: currentPowerSnapshot.chargeRateText,
             uptimeText: uptime,
             uptimeSeconds: ProcessInfo.processInfo.systemUptime,
             freeDiskSpaceText: freeDiskSpace,
@@ -637,8 +516,7 @@ final class SystemInfoViewModel: ObservableObject {
         }
 
         let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
+        formatter.setLocalizedDateFormatFromTemplate("MMM d h:mm a")
         return formatter.string(from: timestamp)
     }
 }
@@ -828,13 +706,22 @@ struct StatRow: View {
             Text(label)
                 .font(.system(size: 13))
                 .foregroundStyle(.secondary)
+                .frame(width: 86, alignment: .leading)
+                .lineLimit(1)
+                .minimumScaleFactor(0.82)
             
-            Spacer()
+            Spacer(minLength: 8)
             
             Text(value)
-                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .font(.system(size: 12.5, weight: .medium, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .allowsTightening(true)
+                .multilineTextAlignment(.trailing)
+                .frame(alignment: .trailing)
+                .layoutPriority(1)
         }
         .padding(.vertical, 4)
         .padding(.horizontal, 8)
@@ -857,46 +744,54 @@ struct NetworkSpeedBar: View {
     let uploadSpeed: String
     
     var body: some View {
-        HStack(spacing: 20) {
-            HStack(spacing: 8) {
-                Image(systemName: "arrow.down.circle.fill")
-                    .font(.system(size: 18))
-                    .foregroundStyle(.cyan)
-                
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Download")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text(downloadSpeed)
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                }
-            }
-            
-            Spacer()
-            
+        HStack(spacing: 18) {
+            throughputColumn(
+                title: "Download",
+                value: downloadSpeed,
+                icon: "arrow.down.circle.fill",
+                accentColor: .cyan
+            )
+
             Rectangle()
-                .fill(Color.gray.opacity(0.3))
-                .frame(width: 1, height: 30)
-            
-            Spacer()
-            
-            HStack(spacing: 8) {
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("Upload")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text(uploadSpeed)
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .monospacedDigit()
-                }
-                
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 18))
-                    .foregroundStyle(.orange)
-            }
+                .fill(Color.gray.opacity(0.22))
+                .frame(width: 1, height: 54)
+
+            throughputColumn(
+                title: "Upload",
+                value: uploadSpeed,
+                icon: "arrow.up.circle.fill",
+                accentColor: .orange
+            )
         }
-        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 6)
+    }
+
+    private func throughputColumn(
+        title: String,
+        value: String,
+        icon: String,
+        accentColor: Color
+    ) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 20))
+                .foregroundStyle(accentColor)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                Text(value)
+                    .font(.system(size: 18, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1018,10 +913,6 @@ struct ContentView: View {
         )
     }
 
-    private var adaptiveColumns: [GridItem] {
-        [GridItem(.adaptive(minimum: 250), spacing: 16, alignment: .top)]
-    }
-
     var body: some View {
         NavigationSplitView {
             List(selection: $selectedSection) {
@@ -1055,33 +946,39 @@ struct ContentView: View {
                 }
 
                 Section("Monitoring") {
-                    LabeledContent("Samples", value: "\(viewModel.historySampleCount)")
-                    LabeledContent("Last saved", value: viewModel.lastHistorySave)
-                    LabeledContent("Report updated", value: viewModel.lastReportGenerated)
+                    DashboardSidebarMetricRow(label: "Samples", value: "\(viewModel.historySampleCount)")
+                    DashboardSidebarMetricRow(label: "Saved", value: viewModel.lastHistorySave)
+                    DashboardSidebarMetricRow(label: "Report", value: viewModel.lastReportGenerated)
                 }
             }
             .listStyle(.sidebar)
             .navigationTitle("System Monitor")
+            .navigationSplitViewColumnWidth(min: 280, ideal: 300, max: 320)
         } detail: {
             Group {
                 if let activeSection {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 24) {
-                            DashboardHeroCard(
-                                summary: healthSummary,
-                                hostName: viewModel.hostName,
-                                macOSVersion: viewModel.macOSVersion,
-                                cpuModel: viewModel.cpuModel,
-                                gpuName: viewModel.gpuName,
-                                historySubtitle: historySubtitle,
-                                lastSaved: viewModel.lastHistorySave,
-                                accentColor: toneColor(for: healthSummary.tone)
-                            )
+                    GeometryReader { proxy in
+                        let contentWidth = max(proxy.size.width - 40, 320)
 
-                            sectionContent(for: activeSection)
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 20) {
+                                DashboardHeroCard(
+                                    summary: healthSummary,
+                                    hostName: viewModel.hostName,
+                                    macOSVersion: viewModel.macOSVersion,
+                                    cpuModel: viewModel.cpuModel,
+                                    gpuName: viewModel.gpuName,
+                                    historySubtitle: historySubtitle,
+                                    lastSaved: viewModel.lastHistorySave,
+                                    accentColor: toneColor(for: healthSummary.tone),
+                                    showFactsPanel: activeSection == .overview
+                                )
+
+                                sectionContent(for: activeSection, availableWidth: contentWidth)
+                            }
+                            .padding(20)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .padding(24)
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .navigationTitle(activeSection.title)
                 } else {
@@ -1120,29 +1017,32 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func sectionContent(for section: DashboardSection) -> some View {
+    private func sectionContent(for section: DashboardSection, availableWidth: CGFloat) -> some View {
         switch section {
         case .overview:
-            overviewSection
+            overviewSection(availableWidth: availableWidth)
         case .performance:
-            performanceSection
+            performanceSection(availableWidth: availableWidth)
         case .power:
-            powerSection
+            powerSection(availableWidth: availableWidth)
         case .network:
-            networkSection
+            networkSection(availableWidth: availableWidth)
         case .history:
-            historySection
+            historySection(availableWidth: availableWidth)
         }
     }
 
-    private var overviewSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+    private func overviewSection(availableWidth: CGFloat) -> some View {
+        let gaugeColumns = gridColumns(for: availableWidth, minimumCardWidth: 280, maxColumns: 3)
+        let factsColumns = gridColumns(for: availableWidth, minimumCardWidth: 340, maxColumns: 2)
+
+        return VStack(alignment: .leading, spacing: 16) {
             DashboardSectionHeader(
                 title: "At-a-glance health",
                 subtitle: "The primary signals you care about, organized as a real dashboard instead of a long dump."
             )
 
-            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+            LazyVGrid(columns: gaugeColumns, spacing: 16) {
                 DashboardGaugeCard(
                     title: "CPU Activity",
                     subtitle: "Delta-based usage from host CPU ticks.",
@@ -1150,7 +1050,8 @@ struct ContentView: View {
                     label: "CPU",
                     valueText: viewModel.cpuUsage,
                     icon: "cpu.fill",
-                    colors: [.blue, .cyan]
+                    colors: [.blue, .cyan],
+                    minHeight: 170
                 )
 
                 DashboardGaugeCard(
@@ -1160,7 +1061,8 @@ struct ContentView: View {
                     label: "Memory",
                     valueText: memoryPercent,
                     icon: "memorychip.fill",
-                    colors: [.indigo, .blue]
+                    colors: [.indigo, .blue],
+                    minHeight: 170
                 )
 
                 DashboardGaugeCard(
@@ -1170,7 +1072,8 @@ struct ContentView: View {
                     label: "Disk",
                     valueText: diskPercent,
                     icon: "internaldrive.fill",
-                    colors: [.orange, .yellow]
+                    colors: [.orange, .yellow],
+                    minHeight: 170
                 )
 
                 DashboardGaugeCard(
@@ -1180,14 +1083,16 @@ struct ContentView: View {
                     label: "Battery",
                     valueText: viewModel.batteryLevel,
                     icon: "battery.100",
-                    colors: batteryGradient
+                    colors: batteryGradient,
+                    minHeight: 170
                 )
             }
 
-            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+            LazyVGrid(columns: factsColumns, spacing: 16) {
                 DashboardFactsCard(
                     title: "Machine Profile",
-                    subtitle: "Identity and hardware context for this Mac."
+                    subtitle: "Identity and hardware context for this Mac.",
+                    minHeight: 196
                 ) {
                     StatRow(icon: "desktopcomputer", label: "Host", value: viewModel.hostName, iconColor: .teal)
                     StatRow(icon: "applelogo", label: "macOS", value: viewModel.macOSVersion, iconColor: .blue)
@@ -1197,12 +1102,13 @@ struct ContentView: View {
 
                 DashboardFactsCard(
                     title: "Operational Snapshot",
-                    subtitle: "Live health markers that explain the current state."
+                    subtitle: "Live health markers that explain the current state.",
+                    minHeight: 196
                 ) {
                     StatRow(icon: "waveform.path.ecg", label: "Load Average", value: viewModel.loadAverage, iconColor: .indigo)
                     StatRow(icon: "thermometer.medium", label: "Thermal State", value: viewModel.thermalState, iconColor: thermalColor)
                     StatRow(icon: "clock.arrow.circlepath", label: "Uptime", value: viewModel.uptime, iconColor: .teal)
-                    StatRow(icon: "bolt.badge.clock", label: "Power Usage", value: viewModel.powerUsage, iconColor: .pink)
+                    StatRow(icon: "bolt.badge.clock", label: "System Power", value: viewModel.powerUsage, iconColor: .pink)
                 }
 
                 historySummaryCard
@@ -1210,17 +1116,20 @@ struct ContentView: View {
         }
     }
 
-    private var performanceSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+    private func performanceSection(availableWidth: CGFloat) -> some View {
+        let columns = gridColumns(for: availableWidth, minimumCardWidth: 360, maxColumns: 2)
+
+        return VStack(alignment: .leading, spacing: 16) {
             DashboardSectionHeader(
                 title: "Performance signals",
                 subtitle: "CPU, memory, disk, and thermal readings presented together so regressions are easier to spot."
             )
 
-            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+            LazyVGrid(columns: columns, spacing: 16) {
                 DashboardFactsCard(
                     title: "Processor",
-                    subtitle: "Live compute pressure and hardware context."
+                    subtitle: "Live compute pressure and hardware context.",
+                    minHeight: 196
                 ) {
                     StatRow(icon: "cpu.fill", label: "Usage", value: viewModel.cpuUsage, iconColor: .blue)
                     StatRow(icon: "waveform.path.ecg", label: "Load Average", value: viewModel.loadAverage, iconColor: .indigo)
@@ -1230,7 +1139,8 @@ struct ContentView: View {
 
                 DashboardFactsCard(
                     title: "Memory & Storage",
-                    subtitle: "Capacity versus free headroom."
+                    subtitle: "Capacity versus free headroom.",
+                    minHeight: 196
                 ) {
                     StatRow(icon: "memorychip.fill", label: "Used Memory", value: viewModel.memoryUsage, iconColor: .purple)
                     StatRow(icon: "memorychip", label: "Free Memory", value: viewModel.freeMemory, iconColor: .indigo)
@@ -1240,84 +1150,67 @@ struct ContentView: View {
 
                 DashboardFactsCard(
                     title: "Thermals",
-                    subtitle: "Current operating state and the readings around it."
+                    subtitle: "Current operating state and the readings around it.",
+                    minHeight: 196
                 ) {
                     StatRow(icon: "thermometer.medium", label: "Thermal State", value: viewModel.thermalState, iconColor: thermalColor)
                     StatRow(icon: "clock.arrow.circlepath", label: "Uptime", value: viewModel.uptime, iconColor: .teal)
-                    StatRow(icon: "bolt.badge.clock", label: "Power Usage", value: viewModel.powerUsage, iconColor: .pink)
+                    StatRow(icon: "bolt.badge.clock", label: "System Power", value: viewModel.powerUsage, iconColor: .pink)
                     StatRow(icon: "desktopcomputer", label: "GPU", value: viewModel.gpuName, iconColor: .mint)
                 }
             }
         }
     }
 
-    private var powerSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+    private func powerSection(availableWidth: CGFloat) -> some View {
+        let columns = gridColumns(for: availableWidth, minimumCardWidth: 360, maxColumns: 2)
+
+        return VStack(alignment: .leading, spacing: 16) {
             DashboardSectionHeader(
                 title: "Power center",
-                subtitle: "Battery, live wattage, and thermal behavior in one place for a more realistic view of system efficiency."
+                subtitle: "Battery state, scoped system-power telemetry, and charging behavior in one place for a clearer view of efficiency."
             )
 
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 16) {
-                    DashboardGaugeCard(
-                        title: "Battery Charge",
-                        subtitle: "Current reserve level and source context.",
-                        value: batteryValue,
-                        label: "Battery",
-                        valueText: viewModel.batteryLevel,
-                        icon: "battery.100",
-                        colors: batteryGradient
-                    )
+            LazyVGrid(columns: columns, spacing: 16) {
+                DashboardGaugeCard(
+                    title: "Battery Charge",
+                    subtitle: "Current reserve level and source context.",
+                    value: batteryValue,
+                    label: "Battery",
+                    valueText: viewModel.batteryLevel,
+                    icon: "battery.100",
+                    colors: batteryGradient,
+                    minHeight: 176
+                )
 
-                    DashboardGaugeCard(
-                        title: "Power Draw",
-                        subtitle: "Estimated from the reported voltage and current.",
-                        value: powerGaugeValue,
-                        label: "Power",
-                        valueText: viewModel.powerUsage,
-                        icon: "bolt.fill",
-                        colors: powerGradient
-                    )
-                }
-
-                VStack(spacing: 16) {
-                    DashboardGaugeCard(
-                        title: "Battery Charge",
-                        subtitle: "Current reserve level and source context.",
-                        value: batteryValue,
-                        label: "Battery",
-                        valueText: viewModel.batteryLevel,
-                        icon: "battery.100",
-                        colors: batteryGradient
-                    )
-
-                    DashboardGaugeCard(
-                        title: "Power Draw",
-                        subtitle: "Estimated from the reported voltage and current.",
-                        value: powerGaugeValue,
-                        label: "Power",
-                        valueText: viewModel.powerUsage,
-                        icon: "bolt.fill",
-                        colors: powerGradient
-                    )
-                }
+                DashboardGaugeCard(
+                    title: "System Power",
+                    subtitle: "Whole-system draw from AppleSmartBattery telemetry when available.",
+                    value: powerGaugeValue,
+                    label: "System",
+                    valueText: viewModel.powerUsage,
+                    icon: "bolt.fill",
+                    colors: powerGradient,
+                    minHeight: 176
+                )
             }
 
-            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+            LazyVGrid(columns: columns, spacing: 16) {
                 DashboardFactsCard(
                     title: "Power Snapshot",
-                    subtitle: "Current battery and charging state."
+                    subtitle: "Current battery state plus separate system-power and charging signals.",
+                    minHeight: 196
                 ) {
                     StatRow(icon: "battery.100", label: "Battery Level", value: viewModel.batteryLevel, iconColor: batteryGradient.first ?? .green)
                     StatRow(icon: "powerplug", label: "Power Source", value: viewModel.powerSource, iconColor: .yellow)
-                    StatRow(icon: "bolt.badge.clock", label: "Power Usage", value: viewModel.powerUsage, iconColor: .pink)
-                    StatRow(icon: "bolt.fill", label: "Charge Rate", value: viewModel.chargingWattage, iconColor: .orange)
+                    StatRow(icon: "bolt.badge.clock", label: "System Power", value: viewModel.powerUsage, iconColor: .pink)
+                    StatRow(icon: "bolt.fill", label: "Battery Charge Rate", value: viewModel.chargingWattage, iconColor: .orange)
                 }
 
                 DashboardFactsCard(
                     title: "Thermal Context",
-                    subtitle: "Signals that often move with battery drain and charger load."
+                    subtitle: "Signals that often move with battery drain and charger load.",
+                    minHeight: 196
                 ) {
                     StatRow(icon: "thermometer.medium", label: "Thermal State", value: viewModel.thermalState, iconColor: thermalColor)
                     StatRow(icon: "cpu.fill", label: "CPU Usage", value: viewModel.cpuUsage, iconColor: .blue)
@@ -1328,17 +1221,20 @@ struct ContentView: View {
         }
     }
 
-    private var networkSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+    private func networkSection(availableWidth: CGFloat) -> some View {
+        let columns = gridColumns(for: availableWidth, minimumCardWidth: 360, maxColumns: 2)
+
+        return VStack(alignment: .leading, spacing: 16) {
             DashboardSectionHeader(
                 title: "Network activity",
                 subtitle: "Connection identity and throughput are grouped here so you can read network conditions without hunting for them."
             )
 
-            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+            LazyVGrid(columns: columns, spacing: 16) {
                 DashboardFactsCard(
                     title: "Connection",
-                    subtitle: "Current link identity."
+                    subtitle: "Current link identity.",
+                    minHeight: 176
                 ) {
                     StatRow(icon: "wifi", label: "Wi-Fi", value: viewModel.wifiNetwork, iconColor: .blue)
                     StatRow(icon: "network", label: "IP Address", value: viewModel.ipAddress, iconColor: .purple)
@@ -1357,22 +1253,26 @@ struct ContentView: View {
                             uploadSpeed: viewModel.uploadSpeed
                         )
                     }
+                    .frame(maxWidth: .infinity, minHeight: 176, alignment: .topLeading)
                 }
             }
         }
     }
 
-    private var historySection: some View {
-        VStack(alignment: .leading, spacing: 16) {
+    private func historySection(availableWidth: CGFloat) -> some View {
+        let columns = gridColumns(for: availableWidth, minimumCardWidth: 360, maxColumns: 2)
+
+        return VStack(alignment: .leading, spacing: 16) {
             DashboardSectionHeader(
                 title: "Historical monitoring",
                 subtitle: "Every current stat is persisted periodically and summarized into a Markdown report that you can open or share."
             )
 
-            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+            LazyVGrid(columns: columns, spacing: 16) {
                 DashboardFactsCard(
                     title: "Capture Status",
-                    subtitle: "Persistence cadence and recent write activity."
+                    subtitle: "Persistence cadence and recent write activity.",
+                    minHeight: 188
                 ) {
                     StatRow(icon: "clock.badge.checkmark", label: "Save Cadence", value: "Every 1 min", iconColor: .blue)
                     StatRow(icon: "externaldrive.badge.timemachine", label: "Samples Stored", value: "\(viewModel.historySampleCount)", iconColor: .mint)
@@ -1382,10 +1282,11 @@ struct ContentView: View {
 
                 DashboardFactsCard(
                     title: "Report",
-                    subtitle: "Generated from the saved history."
+                    subtitle: "Generated from the saved history.",
+                    minHeight: 188
                 ) {
                     StatRow(icon: "doc.text.magnifyingglass", label: "Report Updated", value: viewModel.lastReportGenerated, iconColor: .orange)
-                    StatRow(icon: "bolt.badge.clock", label: "Latest Power", value: viewModel.powerUsage, iconColor: .pink)
+                    StatRow(icon: "bolt.badge.clock", label: "Latest System Power", value: viewModel.powerUsage, iconColor: .pink)
                     StatRow(icon: "waveform.path.ecg", label: "Latest CPU", value: viewModel.cpuUsage, iconColor: .blue)
                     StatRow(icon: "memorychip.fill", label: "Latest Memory", value: viewModel.memoryUsage, iconColor: .indigo)
                 }
@@ -1437,43 +1338,53 @@ struct ContentView: View {
     }
 
     private var historySummaryCard: some View {
-        GlassCard {
-            VStack(alignment: .leading, spacing: 12) {
-                DashboardPanelHeader(
-                    title: "Monitoring history",
-                    subtitle: historySubtitle
-                )
+        DashboardFactsCard(
+            title: "Monitoring history",
+            subtitle: historySubtitle,
+            minHeight: 228
+        ) {
+            StatRow(icon: "square.and.arrow.down", label: "Last Saved", value: viewModel.lastHistorySave, iconColor: .green)
+            StatRow(icon: "doc.text.magnifyingglass", label: "Report Updated", value: viewModel.lastReportGenerated, iconColor: .orange)
 
-                StatRow(icon: "square.and.arrow.down", label: "Last Saved", value: viewModel.lastHistorySave, iconColor: .green)
-                StatRow(icon: "doc.text.magnifyingglass", label: "Report Updated", value: viewModel.lastReportGenerated, iconColor: .orange)
-
-                Text(viewModel.latestReportText)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .background {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(Color.primary.opacity(0.045))
-                    }
-            }
+            Text(viewModel.latestReportText)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineLimit(7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color.primary.opacity(0.045))
+                }
         }
     }
 
     private func sidebarSubtitle(for section: DashboardSection) -> String {
-        switch section {
-        case .overview:
-            return healthSummary.subtitle
-        case .performance:
-            return "\(viewModel.cpuUsage) CPU • \(memoryPercent) memory"
-        case .power:
-            return "\(viewModel.powerUsage) • \(viewModel.powerSource)"
-        case .network:
-            return "\(viewModel.downloadSpeed) down • \(viewModel.uploadSpeed) up"
-        case .history:
-            return historySubtitle
-        }
+        DashboardPresentationBuilder.compactSectionSummary(
+            for: section,
+            healthSummary: healthSummary,
+            cpuUsageText: viewModel.cpuUsage,
+            memoryPercentText: memoryPercent,
+            powerUsageText: viewModel.powerUsage,
+            powerSource: viewModel.powerSource,
+            downloadSpeedText: viewModel.downloadSpeed,
+            uploadSpeedText: viewModel.uploadSpeed,
+            sampleCount: viewModel.historySampleCount,
+            coverageText: viewModel.historyCoverage
+        )
+    }
+
+    private func gridColumns(for availableWidth: CGFloat, minimumCardWidth: CGFloat, maxColumns: Int) -> [GridItem] {
+        let count = DashboardPresentationBuilder.columnCount(
+            for: availableWidth,
+            minimumCardWidth: minimumCardWidth,
+            maxColumns: maxColumns
+        )
+
+        return Array(
+            repeating: GridItem(.flexible(minimum: 0, maximum: .infinity), spacing: 16, alignment: .top),
+            count: count
+        )
     }
 
     private func sectionAccentColor(for section: DashboardSection) -> Color {
@@ -1546,23 +1457,28 @@ private struct DashboardSidebarStatusCard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(summary.title)
                         .font(.system(size: 13, weight: .semibold))
+                        .lineLimit(1)
                     Text(hostName)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
 
             Text(summary.subtitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
 
             Text(macOSVersion)
                 .font(.caption2)
                 .foregroundStyle(accentColor)
+                .lineLimit(1)
 
             Text(historySubtitle)
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+                .lineLimit(1)
         }
         .padding(12)
         .background {
@@ -1590,10 +1506,34 @@ private struct DashboardSidebarSectionRow: View {
                 Text(subtitle)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+private struct DashboardSidebarMetricRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 54, alignment: .leading)
+
+            Spacer(minLength: 0)
+
+            Text(value)
+                .font(.caption.monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .foregroundStyle(.primary)
+        }
+        .padding(.vertical, 2)
     }
 }
 
@@ -1606,19 +1546,24 @@ private struct DashboardHeroCard: View {
     let historySubtitle: String
     let lastSaved: String
     let accentColor: Color
+    let showFactsPanel: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: 18) {
-                    heading
-                    facts
-                }
+        VStack(alignment: .leading, spacing: showFactsPanel ? 18 : 12) {
+            if showFactsPanel {
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 18) {
+                        heading
+                        facts
+                    }
 
-                VStack(alignment: .leading, spacing: 18) {
-                    heading
-                    facts
+                    VStack(alignment: .leading, spacing: 18) {
+                        heading
+                        facts
+                    }
                 }
+            } else {
+                heading
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
@@ -1636,9 +1581,9 @@ private struct DashboardHeroCard: View {
                 }
             }
         }
-        .padding(22)
+        .padding(showFactsPanel ? 18 : 16)
         .background {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: showFactsPanel ? 24 : 20, style: .continuous)
                 .fill(
                     LinearGradient(
                         colors: [
@@ -1651,11 +1596,11 @@ private struct DashboardHeroCard: View {
                     )
                 )
                 .overlay {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    RoundedRectangle(cornerRadius: showFactsPanel ? 24 : 20, style: .continuous)
                         .fill(.thinMaterial.opacity(0.55))
                 }
                 .overlay {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    RoundedRectangle(cornerRadius: showFactsPanel ? 24 : 20, style: .continuous)
                         .stroke(Color.white.opacity(0.18), lineWidth: 1)
                 }
         }
@@ -1668,51 +1613,59 @@ private struct DashboardHeroCard: View {
                 .foregroundStyle(.secondary)
 
             Text(summary.title)
-                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .font(.system(size: 24, weight: .bold, design: .rounded))
 
             Text(summary.subtitle)
-                .font(.system(size: 14))
+                .font(.system(size: 13))
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var facts: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            DashboardFactPill(label: "Host", value: hostName, accentColor: accentColor)
-            DashboardFactPill(label: "macOS", value: macOSVersion, accentColor: .blue)
-            DashboardFactPill(label: "CPU", value: cpuModel, accentColor: .indigo)
-            DashboardFactPill(label: "GPU", value: gpuName, accentColor: .mint)
-            DashboardFactPill(label: "History", value: historySubtitle, accentColor: .green)
-            DashboardFactPill(label: "Last Save", value: lastSaved, accentColor: .orange)
+        VStack(alignment: .leading, spacing: 0) {
+            DashboardHeroFactRow(label: "Host", value: hostName, accentColor: accentColor)
+            Divider().overlay(Color.white.opacity(0.08))
+            DashboardHeroFactRow(label: "macOS", value: macOSVersion, accentColor: .blue)
+            Divider().overlay(Color.white.opacity(0.08))
+            DashboardHeroFactRow(label: "CPU", value: cpuModel, accentColor: .indigo)
+            Divider().overlay(Color.white.opacity(0.08))
+            DashboardHeroFactRow(label: "GPU", value: gpuName, accentColor: .mint)
+            Divider().overlay(Color.white.opacity(0.08))
+            DashboardHeroFactRow(label: "History", value: historySubtitle, accentColor: .green)
+            Divider().overlay(Color.white.opacity(0.08))
+            DashboardHeroFactRow(label: "Last Save", value: lastSaved, accentColor: .orange)
         }
         .frame(maxWidth: 360, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.14))
+        }
     }
 }
 
-private struct DashboardFactPill: View {
+private struct DashboardHeroFactRow: View {
     let label: String
     let value: String
     let accentColor: Color
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             Text(label)
-                .font(.caption2.weight(.semibold))
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(accentColor)
-                .frame(width: 62, alignment: .leading)
+                .frame(width: 68, alignment: .leading)
+                .lineLimit(1)
 
             Text(value)
                 .font(.caption)
                 .foregroundStyle(.primary)
                 .lineLimit(1)
+                .minimumScaleFactor(0.78)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color.white.opacity(0.18))
-        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 }
 
@@ -1728,6 +1681,7 @@ private struct DashboardSectionHeader: View {
             Text(subtitle)
                 .font(.system(size: 13))
                 .foregroundStyle(.secondary)
+                .lineLimit(2)
         }
     }
 }
@@ -1740,11 +1694,14 @@ private struct DashboardPanelHeader: View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
 
             Text(subtitle)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(2)
         }
+        .frame(maxWidth: .infinity, minHeight: 38, alignment: .topLeading)
     }
 }
 
@@ -1756,6 +1713,7 @@ private struct DashboardGaugeCard: View {
     let valueText: String
     let icon: String
     let colors: [Color]
+    var minHeight: CGFloat = 170
 
     var body: some View {
         GlassCard {
@@ -1774,6 +1732,7 @@ private struct DashboardGaugeCard: View {
                     Spacer(minLength: 0)
                 }
             }
+            .frame(maxWidth: .infinity, minHeight: minHeight, alignment: .topLeading)
         }
     }
 }
@@ -1781,15 +1740,18 @@ private struct DashboardGaugeCard: View {
 private struct DashboardFactsCard<Content: View>: View {
     let title: String
     let subtitle: String
+    let minHeight: CGFloat
     let content: Content
 
     init(
         title: String,
         subtitle: String,
+        minHeight: CGFloat = 196,
         @ViewBuilder content: () -> Content
     ) {
         self.title = title
         self.subtitle = subtitle
+        self.minHeight = minHeight
         self.content = content()
     }
 
@@ -1799,6 +1761,7 @@ private struct DashboardFactsCard<Content: View>: View {
                 DashboardPanelHeader(title: title, subtitle: subtitle)
                 content
             }
+            .frame(maxWidth: .infinity, minHeight: minHeight, alignment: .topLeading)
         }
     }
 }

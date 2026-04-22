@@ -13,6 +13,8 @@ struct DashboardPresentationTests {
         testCriticalStatusUsesThermalAndCpuSignals()
         testFilteringMatchesTitlesAndKeywords()
         testHistorySubtitleHandlesPluralization()
+        testCompactSidebarSummariesStayShort()
+        testColumnCountBalancesDensityAndReadability()
         print("Dashboard presentation tests passed")
     }
 
@@ -27,7 +29,7 @@ struct DashboardPresentationTests {
         expect(summary.tone == .critical, "critical thermal state should escalate tone")
         expect(summary.title == "System under pressure", "critical title mismatch")
         expect(summary.highlights.contains("CPU 92%"), "cpu highlight missing")
-        expect(summary.highlights.contains("Power 38.0 W"), "power highlight missing")
+        expect(summary.highlights.contains("System Power 38.0 W"), "power highlight missing")
     }
 
     private static func testFilteringMatchesTitlesAndKeywords() {
@@ -44,6 +46,80 @@ struct DashboardPresentationTests {
         expect(
             DashboardPresentationBuilder.historySubtitle(sampleCount: 12, coverageText: "2h 0m") == "12 samples captured over 2h 0m",
             "plural sample subtitle mismatch"
+        )
+    }
+
+    private static func testCompactSidebarSummariesStayShort() {
+        let summary = DashboardHealthSummary(
+            tone: .elevated,
+            title: "System needs attention",
+            subtitle: "One or more signals are trending away from nominal.",
+            highlights: []
+        )
+
+        expect(
+            DashboardPresentationBuilder.compactSectionSummary(
+                for: .performance,
+                healthSummary: summary,
+                cpuUsageText: "27%",
+                memoryPercentText: "85%",
+                powerUsageText: "—",
+                powerSource: "AC Power",
+                downloadSpeedText: "58.1 KB/s",
+                uploadSpeedText: "31.0 KB/s",
+                sampleCount: 2,
+                coverageText: "1m"
+            ) == "CPU 27% · MEM 85%",
+            "performance compact summary mismatch"
+        )
+
+        expect(
+            DashboardPresentationBuilder.compactSectionSummary(
+                for: .network,
+                healthSummary: summary,
+                cpuUsageText: "27%",
+                memoryPercentText: "85%",
+                powerUsageText: "—",
+                powerSource: "AC Power",
+                downloadSpeedText: "58.1 KB/s",
+                uploadSpeedText: "31.0 KB/s",
+                sampleCount: 2,
+                coverageText: "1m"
+            ) == "58.1K↓ · 31.0K↑",
+            "network compact summary mismatch"
+        )
+
+        expect(
+            DashboardPresentationBuilder.compactSectionSummary(
+                for: .history,
+                healthSummary: summary,
+                cpuUsageText: "27%",
+                memoryPercentText: "85%",
+                powerUsageText: "—",
+                powerSource: "AC Power",
+                downloadSpeedText: "58.1 KB/s",
+                uploadSpeedText: "31.0 KB/s",
+                sampleCount: 2,
+                coverageText: "1m"
+            ) == "2 samples · 1m",
+            "history compact summary mismatch"
+        )
+    }
+
+    private static func testColumnCountBalancesDensityAndReadability() {
+        expect(
+            DashboardPresentationBuilder.columnCount(for: 540, minimumCardWidth: 280, maxColumns: 3) == 1,
+            "narrow widths should collapse to one column"
+        )
+
+        expect(
+            DashboardPresentationBuilder.columnCount(for: 900, minimumCardWidth: 280, maxColumns: 3) == 3,
+            "wide gauge rows should use three columns when the cards fit"
+        )
+
+        expect(
+            DashboardPresentationBuilder.columnCount(for: 900, minimumCardWidth: 360, maxColumns: 3) == 2,
+            "dense fact cards should step down to two columns for readability"
         )
     }
 }
