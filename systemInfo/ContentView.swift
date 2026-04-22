@@ -8,6 +8,7 @@
 import SwiftUI
 import Combine
 import Darwin
+import AppKit
 import IOKit.ps
 
 /// View model that gathers and formats system information for display.
@@ -19,6 +20,7 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var memoryUsage: String = ""
     @Published var batteryLevel: String = ""
     @Published var powerSource: String = ""
+    @Published var powerUsage: String = "—"
     @Published var chargingWattage: String = ""
     @Published var uptime: String = ""
     @Published var freeDiskSpace: String = ""
@@ -38,12 +40,25 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var batteryTemperature: String = ""
     @Published var batteryCycleCount: String = ""
     @Published var freeMemory: String = ""
+    @Published var historySampleCount: Int = 0
+    @Published var historyCoverage: String = "0m"
+    @Published var lastHistorySave: String = "—"
+    @Published var lastReportGenerated: String = "—"
+    @Published var latestReportText: String = "Historical samples will appear here once the app captures them."
 
     private let networkMonitor = NetworkMonitor()
+    private let historyStore = SystemHistoryStore()
     private var timer: Timer?
+    private var lastPersistedAt: Date?
+    private var latestDownloadBytesPerSecond: Double = 0
+    private var latestUploadBytesPerSecond: Double = 0
+
+    private let historySaveInterval: TimeInterval = 60
 
     init() {
         updateStaticInfo()
+        hydrateHistory()
+        updateDynamicInfo(forcePersist: true)
         startUpdating()
     }
 
@@ -80,7 +95,8 @@ final class SystemInfoViewModel: ObservableObject {
         }
     }
 
-    private func updateDynamicInfo() {
+    private func updateDynamicInfo(forcePersist: Bool = false) {
+        let now = Date()
         uptime = Self.format(uptimeSeconds: ProcessInfo.processInfo.systemUptime)
 
         memoryUsage = Self.memoryUsageSummary()
@@ -90,6 +106,8 @@ final class SystemInfoViewModel: ObservableObject {
         updatePowerInfo()
 
         let speeds = networkMonitor.currentSpeeds()
+        latestDownloadBytesPerSecond = speeds.download
+        latestUploadBytesPerSecond = speeds.upload
         downloadSpeed = Self.format(bytesPerSecond: speeds.download)
         uploadSpeed = Self.format(bytesPerSecond: speeds.upload)
         
@@ -99,6 +117,7 @@ final class SystemInfoViewModel: ObservableObject {
         wifiNetwork = Self.getWiFiSSID()
         freeMemory = Self.getFreeMemory()
         updateDiskUsage()
+        persistHistoryIfNeeded(capturedAt: now, force: forcePersist)
     }
     
     private func updateDiskUsage() {
@@ -151,7 +170,8 @@ final class SystemInfoViewModel: ObservableObject {
         let info = Self.batteryInfo()
         batteryLevel = info.level
         powerSource = info.source
-        chargingWattage = info.watts
+        powerUsage = info.usage
+        chargingWattage = info.chargeRate
     }
 
     // Track last CPU ticks so we can compute a delta-based usage percentage.
@@ -204,11 +224,11 @@ final class SystemInfoViewModel: ObservableObject {
         return String(format: "%.2f, %.2f", loads[0], loads[1])
     }
 
-    private static func batteryInfo() -> (level: String, source: String, watts: String) {
+    private static func batteryInfo() -> (level: String, source: String, usage: String, chargeRate: String) {
         guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
               let list = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef],
               !list.isEmpty else {
-            return ("—", "No battery", "—")
+            return ("—", "No battery", "—", "—")
         }
 
         for ps in list {
@@ -238,21 +258,28 @@ final class SystemInfoViewModel: ObservableObject {
                 sourceString = state ?? "Unknown"
             }
 
-            // Charging wattage (approximate)
-            var wattsString = "—"
+            // Estimate current battery power flow from the reported voltage/current pair.
+            var usageString = "—"
+            var chargeRateString = "—"
             if let voltage = description[kIOPSVoltageKey as String] as? Double,
                let currentMA = description[kIOPSCurrentKey as String] as? Double {
-                // voltage is in mV, current in mA → W = V * A
+                // Voltage is in mV and current is in mA, so dividing by 1_000_000
+                // yields watts. We expose it as the live power usage signal and,
+                // when charging, also as the charge rate.
                 let watts = abs(voltage * currentMA) / 1_000_000.0
                 if watts > 0.1 {
-                    wattsString = String(format: "%.1f W", watts)
+                    usageString = String(format: "%.1f W", watts)
+                    let isCharging = description[kIOPSIsChargingKey as String] as? Bool ?? false
+                    if isCharging {
+                        chargeRateString = usageString
+                    }
                 }
             }
 
-            return (levelString, sourceString, wattsString)
+            return (levelString, sourceString, usageString, chargeRateString)
         }
 
-        return ("—", "No battery", "—")
+        return ("—", "No battery", "—", "—")
     }
 
     // MARK: - Formatting helpers
@@ -467,6 +494,153 @@ final class SystemInfoViewModel: ObservableObject {
         
         return String(format: "%.1f / %.1f GB", availableGB, totalGB)
     }
+
+    private func hydrateHistory() {
+        do {
+            let samples = try historyStore.loadSamples()
+            updateHistoryMetadata(with: samples)
+
+            if let report = try historyStore.loadReport() {
+                latestReportText = report
+                lastReportGenerated = Self.format(timestamp: samples.last?.capturedAt)
+            } else if !samples.isEmpty {
+                let report = try historyStore.refreshReport(using: samples, generatedAt: Date())
+                latestReportText = report
+                lastReportGenerated = Self.format(timestamp: Date())
+            }
+        } catch {
+            latestReportText = "Unable to load monitoring history: \(error.localizedDescription)"
+        }
+    }
+
+    private func persistHistoryIfNeeded(capturedAt: Date, force: Bool = false) {
+        if !force, let lastPersistedAt, capturedAt.timeIntervalSince(lastPersistedAt) < historySaveInterval {
+            return
+        }
+
+        do {
+            let samples = try historyStore.record(currentHistorySample(capturedAt: capturedAt))
+            let report = try historyStore.refreshReport(using: samples, generatedAt: capturedAt)
+
+            lastPersistedAt = capturedAt
+            lastHistorySave = Self.format(timestamp: capturedAt)
+            lastReportGenerated = Self.format(timestamp: capturedAt)
+            latestReportText = report
+            updateHistoryMetadata(with: samples)
+        } catch {
+            latestReportText = "Unable to persist monitoring history: \(error.localizedDescription)"
+        }
+    }
+
+    private func updateHistoryMetadata(with samples: [SystemHistorySample]) {
+        let overview = historyStore.overview(for: samples)
+        historySampleCount = overview.sampleCount
+        historyCoverage = overview.coverageText
+
+        if let lastCapturedAt = samples.last?.capturedAt, lastHistorySave == "—" {
+            lastHistorySave = Self.format(timestamp: lastCapturedAt)
+        }
+    }
+
+    private func currentHistorySample(capturedAt: Date) -> SystemHistorySample {
+        let memoryParts = Self.parseUsedTotalPair(from: memoryUsage)
+        let loadAverageParts = Self.parseLoadAverage(from: loadAverage)
+
+        return SystemHistorySample(
+            capturedAt: capturedAt,
+            hostName: hostName,
+            macOSVersion: macOSVersion,
+            cpuModel: cpuModel,
+            cpuCores: cpuCores,
+            gpuName: gpuName,
+            cpuUsageText: cpuUsage,
+            cpuUsagePercent: Self.parsePercent(from: cpuUsage),
+            loadAverageText: loadAverage,
+            loadAverageOneMinute: loadAverageParts.oneMinute,
+            loadAverageFiveMinute: loadAverageParts.fiveMinute,
+            memoryUsageText: memoryUsage,
+            memoryUsedGB: memoryParts.used,
+            memoryTotalGB: memoryParts.total,
+            batteryLevelText: batteryLevel,
+            batteryLevelPercent: Self.parsePercent(from: batteryLevel),
+            powerSource: powerSource,
+            powerUsageText: powerUsage,
+            powerUsageWatts: Self.parseWatts(from: powerUsage),
+            chargingWattageText: chargingWattage,
+            uptimeText: uptime,
+            uptimeSeconds: ProcessInfo.processInfo.systemUptime,
+            freeDiskSpaceText: freeDiskSpace,
+            freeDiskBytes: getFreeDiskSpaceBytes(),
+            totalDiskSpaceText: totalDiskSpace,
+            totalDiskBytes: getTotalDiskSpaceBytes(),
+            diskUsagePercent: diskUsagePercent,
+            downloadSpeedText: downloadSpeed,
+            downloadBytesPerSecond: latestDownloadBytesPerSecond,
+            uploadSpeedText: uploadSpeed,
+            uploadBytesPerSecond: latestUploadBytesPerSecond,
+            thermalState: thermalState,
+            ipAddress: ipAddress,
+            wifiNetwork: wifiNetwork,
+            freeMemoryText: freeMemory
+        )
+    }
+
+    func openLatestReport() {
+        guard FileManager.default.fileExists(atPath: historyStore.reportURL.path) else { return }
+        NSWorkspace.shared.open(historyStore.reportURL)
+    }
+
+    func revealHistoryFolder() {
+        let targetURL = FileManager.default.fileExists(atPath: historyStore.reportURL.path)
+            ? historyStore.reportURL
+            : historyStore.baseDirectoryURL
+        NSWorkspace.shared.activateFileViewerSelecting([targetURL])
+    }
+
+    private static func parsePercent(from text: String) -> Double? {
+        let cleaned = text
+            .replacingOccurrences(of: "%", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Double(cleaned)
+    }
+
+    private static func parseWatts(from text: String) -> Double? {
+        let cleaned = text
+            .replacingOccurrences(of: "W", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Double(cleaned)
+    }
+
+    private static func parseUsedTotalPair(from text: String) -> (used: Double?, total: Double?) {
+        let parts = text.components(separatedBy: " / ")
+        guard parts.count == 2 else {
+            return (nil, nil)
+        }
+
+        let used = Double(parts[0].trimmingCharacters(in: .whitespacesAndNewlines))
+        let total = Double(parts[1].replacingOccurrences(of: " GB", with: "").trimmingCharacters(in: .whitespacesAndNewlines))
+        return (used, total)
+    }
+
+    private static func parseLoadAverage(from text: String) -> (oneMinute: Double?, fiveMinute: Double?) {
+        let parts = text
+            .split(separator: ",")
+            .map { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        let oneMinute = parts.indices.contains(0) ? parts[0] : nil
+        let fiveMinute = parts.indices.contains(1) ? parts[1] : nil
+        return (oneMinute, fiveMinute)
+    }
+
+    private static func format(timestamp: Date?) -> String {
+        guard let timestamp else {
+            return "—"
+        }
+
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: timestamp)
+    }
 }
 
 /// Uses `getifaddrs` to compute network traffic and derive upload/download speeds.
@@ -621,11 +795,15 @@ struct GlassCard<Content: View>: View {
     
     var body: some View {
         content
-            .padding(14)
+            .padding(18)
             .background {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .shadow(color: .black.opacity(0.1), radius: 8, x: 0, y: 4)
+                    .fill(.thinMaterial)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                    }
+                    .shadow(color: .black.opacity(0.05), radius: 12, x: 0, y: 6)
             }
     }
 }
@@ -726,33 +904,51 @@ struct NetworkSpeedBar: View {
 
 struct ContentView: View {
     @StateObject private var viewModel = SystemInfoViewModel()
-    
-    private var cpuValue: Double {
-        let cleaned = viewModel.cpuUsage.replacingOccurrences(of: "%", with: "")
-        return (Double(cleaned) ?? 0) / 100.0
+    @State private var selectedSection: DashboardSection? = .overview
+    @State private var searchText: String = ""
+
+    private var cpuPercent: Double? {
+        percentage(from: viewModel.cpuUsage)
     }
-    
+
+    private var cpuValue: Double {
+        min(max((cpuPercent ?? 0) / 100, 0), 1)
+    }
+
     private var memoryValue: Double {
-        // Parse "X.X / Y.Y GB" format
         let parts = viewModel.memoryUsage.components(separatedBy: " / ")
         if parts.count == 2,
            let used = Double(parts[0]),
-           let total = Double(parts[1].replacingOccurrences(of: " GB", with: "")) {
-            return used / total
+           let total = Double(parts[1].replacingOccurrences(of: " GB", with: "")),
+           total > 0 {
+            return min(max(used / total, 0), 1)
         }
         return 0
     }
-    
+
     private var memoryPercent: String {
-        let pct = memoryValue * 100
-        return String(format: "%.0f%%", pct)
+        String(format: "%.0f%%", memoryValue * 100)
     }
-    
+
+    private var batteryPercent: Double? {
+        percentage(from: viewModel.batteryLevel)
+    }
+
     private var batteryValue: Double {
-        let cleaned = viewModel.batteryLevel.replacingOccurrences(of: "%", with: "")
-        return (Double(cleaned) ?? 0) / 100.0
+        min(max((batteryPercent ?? 0) / 100, 0), 1)
     }
-    
+
+    private var powerUsageWatts: Double? {
+        let cleaned = viewModel.powerUsage
+            .replacingOccurrences(of: "W", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Double(cleaned)
+    }
+
+    private var powerGaugeValue: Double {
+        min(max((powerUsageWatts ?? 0) / 60, 0), 1)
+    }
+
     private var batteryGradient: [Color] {
         if batteryValue < 0.2 {
             return [.red, .orange]
@@ -762,248 +958,400 @@ struct ContentView: View {
             return [.green, .mint]
         }
     }
-    
+
+    private var powerGradient: [Color] {
+        if powerGaugeValue > 0.7 {
+            return [.red, .orange]
+        } else if powerGaugeValue > 0.35 {
+            return [.orange, .yellow]
+        } else {
+            return [.teal, .mint]
+        }
+    }
+
     private var diskPercent: String {
         String(format: "%.0f%%", viewModel.diskUsagePercent * 100)
     }
-    
+
     private var thermalColor: Color {
         switch viewModel.thermalState {
-        case "Normal": return .green
-        case "Fair": return .yellow
-        case "Serious": return .orange
-        case "Critical": return .red
-        default: return .gray
+        case "Normal":
+            return .green
+        case "Fair":
+            return .yellow
+        case "Serious":
+            return .orange
+        case "Critical":
+            return .red
+        default:
+            return .gray
         }
     }
-    
 
-    
+    private var healthSummary: DashboardHealthSummary {
+        DashboardPresentationBuilder.healthSummary(
+            cpuUsagePercent: cpuPercent,
+            batteryLevelPercent: batteryPercent,
+            thermalState: viewModel.thermalState,
+            powerUsageWatts: powerUsageWatts
+        )
+    }
+
+    private var filteredSections: [DashboardSection] {
+        DashboardPresentationBuilder.filteredSections(matching: searchText)
+    }
+
+    private var activeSection: DashboardSection? {
+        guard !filteredSections.isEmpty else {
+            return nil
+        }
+        if let selectedSection, filteredSections.contains(selectedSection) {
+            return selectedSection
+        }
+        return filteredSections.first
+    }
+
+    private var historySubtitle: String {
+        DashboardPresentationBuilder.historySubtitle(
+            sampleCount: viewModel.historySampleCount,
+            coverageText: viewModel.historyCoverage
+        )
+    }
+
+    private var adaptiveColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: 250), spacing: 16, alignment: .top)]
+    }
+
     var body: some View {
-        ScrollView {
-            VStack(spacing: 14) {
-                // Header
-                HStack(spacing: 10) {
-                    ZStack {
-                        Circle()
-                            .fill(
-                                LinearGradient(
-                                    colors: [.blue, .purple],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .frame(width: 36, height: 36)
-                        
-                        Image(systemName: "gauge.with.dots.needle.67percent")
-                            .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(.white)
-                    }
-                    
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("System Monitor")
-                            .font(.system(size: 16, weight: .bold, design: .rounded))
-                        
-                        HStack(spacing: 4) {
-                            Circle()
-                                .fill(.green)
-                                .frame(width: 6, height: 6)
-                            Text("Live • \(viewModel.hostName)")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    
-                    Spacer()
-                    
-                    Text(viewModel.macOSVersion)
-                        .font(.caption)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background {
-                            Capsule()
-                                .fill(Color.blue.opacity(0.15))
-                        }
-                        .foregroundStyle(.blue)
+        NavigationSplitView {
+            List(selection: $selectedSection) {
+                Section {
+                    DashboardSidebarStatusCard(
+                        summary: healthSummary,
+                        hostName: viewModel.hostName,
+                        macOSVersion: viewModel.macOSVersion,
+                        historySubtitle: historySubtitle,
+                        accentColor: toneColor(for: healthSummary.tone)
+                    )
+                    .listRowInsets(EdgeInsets(top: 6, leading: 8, bottom: 10, trailing: 8))
+                    .listRowBackground(Color.clear)
                 }
-                
-                // Main Gauges Section
-                GlassCard {
-                    HStack(spacing: 16) {
-                        CircularGaugeView(
-                            value: cpuValue,
-                            label: "CPU",
-                            valueText: viewModel.cpuUsage,
-                            icon: "cpu",
-                            gradientColors: [.blue, .cyan]
-                        )
-                        
-                        CircularGaugeView(
-                            value: memoryValue,
-                            label: "Memory",
-                            valueText: memoryPercent,
-                            icon: "memorychip",
-                            gradientColors: [.purple, .pink]
-                        )
-                        
-                        CircularGaugeView(
-                            value: viewModel.diskUsagePercent,
-                            label: "Disk",
-                            valueText: diskPercent,
-                            icon: "internaldrive",
-                            gradientColors: [.orange, .yellow]
-                        )
-                        
-                        CircularGaugeView(
-                            value: batteryValue,
-                            label: "Battery",
-                            valueText: viewModel.batteryLevel,
-                            icon: "battery.100",
-                            gradientColors: batteryGradient
-                        )
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                
 
-                // System Details
-                GlassCard {
-                    VStack(spacing: 4) {
-                        HStack {
-                            Text("System")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        .padding(.bottom, 4)
-                        
-                        StatRow(
-                            icon: "waveform.path.ecg",
-                            label: "Load Average",
-                            value: viewModel.loadAverage,
-                            iconColor: .indigo
-                        )
-                        
-                        StatRow(
-                            icon: "clock.arrow.circlepath",
-                            label: "Uptime",
-                            value: viewModel.uptime,
-                            iconColor: .teal
-                        )
-                        
-                        StatRow(
-                            icon: "thermometer.medium",
-                            label: "Thermal State",
-                            value: viewModel.thermalState,
-                            iconColor: thermalColor
-                        )
-                        
-                        StatRow(
-                            icon: "memorychip",
-                            label: "Free Memory",
-                            value: viewModel.freeMemory,
-                            iconColor: .purple
-                        )
-                    }
-                }
-                
-                // Storage Section
-                GlassCard {
-                    VStack(spacing: 4) {
-                        HStack {
-                            Text("Storage")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        .padding(.bottom, 4)
-                        
-                        StatRow(
-                            icon: "internaldrive",
-                            label: "Total Space",
-                            value: viewModel.totalDiskSpace,
-                            iconColor: .orange
-                        )
-                        
-                        StatRow(
-                            icon: "internaldrive.fill",
-                            label: "Free Space",
-                            value: viewModel.freeDiskSpace,
-                            iconColor: .green
-                        )
-                        
-                        StatRow(
-                            icon: "chart.pie",
-                            label: "Used",
-                            value: diskPercent,
-                            iconColor: .red
-                        )
-                    }
-                }
-                
-                // Power Section
-                GlassCard {
-                    VStack(spacing: 4) {
-                        HStack {
-                            Text("Power")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        .padding(.bottom, 4)
-                        
-                        StatRow(
-                            icon: "battery.100",
-                            label: "Battery Level",
-                            value: viewModel.batteryLevel,
-                            iconColor: batteryGradient.first ?? .green
-                        )
-                        
-                        StatRow(
-                            icon: "powerplug",
-                            label: "Power Source",
-                            value: viewModel.powerSource,
-                            iconColor: .yellow
-                        )
-                        
-                        StatRow(
-                            icon: "bolt.fill",
-                            label: "Charge Rate",
-                            value: viewModel.chargingWattage,
-                            iconColor: .orange
-                        )
-                    }
-                }
-                
-                // Network Section
-                GlassCard {
-                    VStack(spacing: 8) {
-                        HStack {
-                            Text("Network")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        
-                        HStack(spacing: 4) {
-                            StatRow(
-                                icon: "wifi",
-                                label: "Wi-Fi",
-                                value: viewModel.wifiNetwork,
-                                iconColor: .blue
+                Section("Sections") {
+                    if filteredSections.isEmpty {
+                        Text("No sections match the current search.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(filteredSections) { section in
+                            DashboardSidebarSectionRow(
+                                section: section,
+                                subtitle: sidebarSubtitle(for: section),
+                                accentColor: sectionAccentColor(for: section)
                             )
+                            .tag(section)
                         }
-                        
-                        StatRow(
-                            icon: "network",
-                            label: "IP Address",
-                            value: viewModel.ipAddress,
-                            iconColor: .purple
+                    }
+                }
+
+                Section("Monitoring") {
+                    LabeledContent("Samples", value: "\(viewModel.historySampleCount)")
+                    LabeledContent("Last saved", value: viewModel.lastHistorySave)
+                    LabeledContent("Report updated", value: viewModel.lastReportGenerated)
+                }
+            }
+            .listStyle(.sidebar)
+            .navigationTitle("System Monitor")
+        } detail: {
+            Group {
+                if let activeSection {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 24) {
+                            DashboardHeroCard(
+                                summary: healthSummary,
+                                hostName: viewModel.hostName,
+                                macOSVersion: viewModel.macOSVersion,
+                                cpuModel: viewModel.cpuModel,
+                                gpuName: viewModel.gpuName,
+                                historySubtitle: historySubtitle,
+                                lastSaved: viewModel.lastHistorySave,
+                                accentColor: toneColor(for: healthSummary.tone)
+                            )
+
+                            sectionContent(for: activeSection)
+                        }
+                        .padding(24)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .navigationTitle(activeSection.title)
+                } else {
+                    ContentUnavailableView(
+                        "No Matching Sections",
+                        systemImage: "magnifyingglass",
+                        description: Text("Try a broader search to bring the dashboard sections back.")
+                    )
+                }
+            }
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+        .searchable(text: $searchText, prompt: "Search sections or report")
+        .toolbar {
+            ToolbarItemGroup {
+                Button {
+                    viewModel.openLatestReport()
+                } label: {
+                    Label("Open Report", systemImage: "doc.text")
+                }
+
+                Button {
+                    viewModel.revealHistoryFolder()
+                } label: {
+                    Label("Reveal Files", systemImage: "folder")
+                }
+            }
+        }
+        .frame(minWidth: 1120, minHeight: 760)
+        .onAppear {
+            reconcileSelection()
+        }
+        .onChange(of: searchText) { _, _ in
+            reconcileSelection()
+        }
+    }
+
+    @ViewBuilder
+    private func sectionContent(for section: DashboardSection) -> some View {
+        switch section {
+        case .overview:
+            overviewSection
+        case .performance:
+            performanceSection
+        case .power:
+            powerSection
+        case .network:
+            networkSection
+        case .history:
+            historySection
+        }
+    }
+
+    private var overviewSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            DashboardSectionHeader(
+                title: "At-a-glance health",
+                subtitle: "The primary signals you care about, organized as a real dashboard instead of a long dump."
+            )
+
+            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+                DashboardGaugeCard(
+                    title: "CPU Activity",
+                    subtitle: "Delta-based usage from host CPU ticks.",
+                    value: cpuValue,
+                    label: "CPU",
+                    valueText: viewModel.cpuUsage,
+                    icon: "cpu.fill",
+                    colors: [.blue, .cyan]
+                )
+
+                DashboardGaugeCard(
+                    title: "Memory Pressure",
+                    subtitle: "Working memory versus installed capacity.",
+                    value: memoryValue,
+                    label: "Memory",
+                    valueText: memoryPercent,
+                    icon: "memorychip.fill",
+                    colors: [.indigo, .blue]
+                )
+
+                DashboardGaugeCard(
+                    title: "Disk Utilization",
+                    subtitle: "Root volume usage based on total versus free space.",
+                    value: viewModel.diskUsagePercent,
+                    label: "Disk",
+                    valueText: diskPercent,
+                    icon: "internaldrive.fill",
+                    colors: [.orange, .yellow]
+                )
+
+                DashboardGaugeCard(
+                    title: "Battery Reserve",
+                    subtitle: "Battery level and source context.",
+                    value: batteryValue,
+                    label: "Battery",
+                    valueText: viewModel.batteryLevel,
+                    icon: "battery.100",
+                    colors: batteryGradient
+                )
+            }
+
+            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+                DashboardFactsCard(
+                    title: "Machine Profile",
+                    subtitle: "Identity and hardware context for this Mac."
+                ) {
+                    StatRow(icon: "desktopcomputer", label: "Host", value: viewModel.hostName, iconColor: .teal)
+                    StatRow(icon: "applelogo", label: "macOS", value: viewModel.macOSVersion, iconColor: .blue)
+                    StatRow(icon: "cpu", label: "CPU", value: viewModel.cpuModel, iconColor: .indigo)
+                    StatRow(icon: "square.stack.3d.up.fill", label: "GPU", value: viewModel.gpuName, iconColor: .mint)
+                }
+
+                DashboardFactsCard(
+                    title: "Operational Snapshot",
+                    subtitle: "Live health markers that explain the current state."
+                ) {
+                    StatRow(icon: "waveform.path.ecg", label: "Load Average", value: viewModel.loadAverage, iconColor: .indigo)
+                    StatRow(icon: "thermometer.medium", label: "Thermal State", value: viewModel.thermalState, iconColor: thermalColor)
+                    StatRow(icon: "clock.arrow.circlepath", label: "Uptime", value: viewModel.uptime, iconColor: .teal)
+                    StatRow(icon: "bolt.badge.clock", label: "Power Usage", value: viewModel.powerUsage, iconColor: .pink)
+                }
+
+                historySummaryCard
+            }
+        }
+    }
+
+    private var performanceSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            DashboardSectionHeader(
+                title: "Performance signals",
+                subtitle: "CPU, memory, disk, and thermal readings presented together so regressions are easier to spot."
+            )
+
+            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+                DashboardFactsCard(
+                    title: "Processor",
+                    subtitle: "Live compute pressure and hardware context."
+                ) {
+                    StatRow(icon: "cpu.fill", label: "Usage", value: viewModel.cpuUsage, iconColor: .blue)
+                    StatRow(icon: "waveform.path.ecg", label: "Load Average", value: viewModel.loadAverage, iconColor: .indigo)
+                    StatRow(icon: "cpu", label: "Model", value: viewModel.cpuModel, iconColor: .cyan)
+                    StatRow(icon: "square.grid.3x1.below.line.grid.1x2", label: "Cores", value: viewModel.cpuCores, iconColor: .mint)
+                }
+
+                DashboardFactsCard(
+                    title: "Memory & Storage",
+                    subtitle: "Capacity versus free headroom."
+                ) {
+                    StatRow(icon: "memorychip.fill", label: "Used Memory", value: viewModel.memoryUsage, iconColor: .purple)
+                    StatRow(icon: "memorychip", label: "Free Memory", value: viewModel.freeMemory, iconColor: .indigo)
+                    StatRow(icon: "internaldrive", label: "Total Disk", value: viewModel.totalDiskSpace, iconColor: .orange)
+                    StatRow(icon: "internaldrive.fill", label: "Free Disk", value: viewModel.freeDiskSpace, iconColor: .green)
+                }
+
+                DashboardFactsCard(
+                    title: "Thermals",
+                    subtitle: "Current operating state and the readings around it."
+                ) {
+                    StatRow(icon: "thermometer.medium", label: "Thermal State", value: viewModel.thermalState, iconColor: thermalColor)
+                    StatRow(icon: "clock.arrow.circlepath", label: "Uptime", value: viewModel.uptime, iconColor: .teal)
+                    StatRow(icon: "bolt.badge.clock", label: "Power Usage", value: viewModel.powerUsage, iconColor: .pink)
+                    StatRow(icon: "desktopcomputer", label: "GPU", value: viewModel.gpuName, iconColor: .mint)
+                }
+            }
+        }
+    }
+
+    private var powerSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            DashboardSectionHeader(
+                title: "Power center",
+                subtitle: "Battery, live wattage, and thermal behavior in one place for a more realistic view of system efficiency."
+            )
+
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 16) {
+                    DashboardGaugeCard(
+                        title: "Battery Charge",
+                        subtitle: "Current reserve level and source context.",
+                        value: batteryValue,
+                        label: "Battery",
+                        valueText: viewModel.batteryLevel,
+                        icon: "battery.100",
+                        colors: batteryGradient
+                    )
+
+                    DashboardGaugeCard(
+                        title: "Power Draw",
+                        subtitle: "Estimated from the reported voltage and current.",
+                        value: powerGaugeValue,
+                        label: "Power",
+                        valueText: viewModel.powerUsage,
+                        icon: "bolt.fill",
+                        colors: powerGradient
+                    )
+                }
+
+                VStack(spacing: 16) {
+                    DashboardGaugeCard(
+                        title: "Battery Charge",
+                        subtitle: "Current reserve level and source context.",
+                        value: batteryValue,
+                        label: "Battery",
+                        valueText: viewModel.batteryLevel,
+                        icon: "battery.100",
+                        colors: batteryGradient
+                    )
+
+                    DashboardGaugeCard(
+                        title: "Power Draw",
+                        subtitle: "Estimated from the reported voltage and current.",
+                        value: powerGaugeValue,
+                        label: "Power",
+                        valueText: viewModel.powerUsage,
+                        icon: "bolt.fill",
+                        colors: powerGradient
+                    )
+                }
+            }
+
+            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+                DashboardFactsCard(
+                    title: "Power Snapshot",
+                    subtitle: "Current battery and charging state."
+                ) {
+                    StatRow(icon: "battery.100", label: "Battery Level", value: viewModel.batteryLevel, iconColor: batteryGradient.first ?? .green)
+                    StatRow(icon: "powerplug", label: "Power Source", value: viewModel.powerSource, iconColor: .yellow)
+                    StatRow(icon: "bolt.badge.clock", label: "Power Usage", value: viewModel.powerUsage, iconColor: .pink)
+                    StatRow(icon: "bolt.fill", label: "Charge Rate", value: viewModel.chargingWattage, iconColor: .orange)
+                }
+
+                DashboardFactsCard(
+                    title: "Thermal Context",
+                    subtitle: "Signals that often move with battery drain and charger load."
+                ) {
+                    StatRow(icon: "thermometer.medium", label: "Thermal State", value: viewModel.thermalState, iconColor: thermalColor)
+                    StatRow(icon: "cpu.fill", label: "CPU Usage", value: viewModel.cpuUsage, iconColor: .blue)
+                    StatRow(icon: "waveform.path.ecg", label: "Load Average", value: viewModel.loadAverage, iconColor: .indigo)
+                    StatRow(icon: "clock.arrow.circlepath", label: "Uptime", value: viewModel.uptime, iconColor: .teal)
+                }
+            }
+        }
+    }
+
+    private var networkSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            DashboardSectionHeader(
+                title: "Network activity",
+                subtitle: "Connection identity and throughput are grouped here so you can read network conditions without hunting for them."
+            )
+
+            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+                DashboardFactsCard(
+                    title: "Connection",
+                    subtitle: "Current link identity."
+                ) {
+                    StatRow(icon: "wifi", label: "Wi-Fi", value: viewModel.wifiNetwork, iconColor: .blue)
+                    StatRow(icon: "network", label: "IP Address", value: viewModel.ipAddress, iconColor: .purple)
+                    StatRow(icon: "desktopcomputer", label: "Host", value: viewModel.hostName, iconColor: .teal)
+                }
+
+                GlassCard {
+                    VStack(alignment: .leading, spacing: 12) {
+                        DashboardPanelHeader(
+                            title: "Throughput",
+                            subtitle: "Download and upload speeds sampled once per second."
                         )
-                        
-                        Divider()
-                            .padding(.vertical, 4)
-                        
+
                         NetworkSpeedBar(
                             downloadSpeed: viewModel.downloadSpeed,
                             uploadSpeed: viewModel.uploadSpeed
@@ -1011,19 +1359,446 @@ struct ContentView: View {
                     }
                 }
             }
-            .padding(20)
         }
-        .frame(width: 380, height: 600)
-        .background {
-            // Subtle gradient background
-            LinearGradient(
-                colors: [
-                    Color(nsColor: .windowBackgroundColor),
-                    Color(nsColor: .windowBackgroundColor).opacity(0.95)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
+    }
+
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            DashboardSectionHeader(
+                title: "Historical monitoring",
+                subtitle: "Every current stat is persisted periodically and summarized into a Markdown report that you can open or share."
             )
+
+            LazyVGrid(columns: adaptiveColumns, spacing: 16) {
+                DashboardFactsCard(
+                    title: "Capture Status",
+                    subtitle: "Persistence cadence and recent write activity."
+                ) {
+                    StatRow(icon: "clock.badge.checkmark", label: "Save Cadence", value: "Every 1 min", iconColor: .blue)
+                    StatRow(icon: "externaldrive.badge.timemachine", label: "Samples Stored", value: "\(viewModel.historySampleCount)", iconColor: .mint)
+                    StatRow(icon: "timeline.selection", label: "Coverage", value: viewModel.historyCoverage, iconColor: .teal)
+                    StatRow(icon: "square.and.arrow.down", label: "Last Saved", value: viewModel.lastHistorySave, iconColor: .green)
+                }
+
+                DashboardFactsCard(
+                    title: "Report",
+                    subtitle: "Generated from the saved history."
+                ) {
+                    StatRow(icon: "doc.text.magnifyingglass", label: "Report Updated", value: viewModel.lastReportGenerated, iconColor: .orange)
+                    StatRow(icon: "bolt.badge.clock", label: "Latest Power", value: viewModel.powerUsage, iconColor: .pink)
+                    StatRow(icon: "waveform.path.ecg", label: "Latest CPU", value: viewModel.cpuUsage, iconColor: .blue)
+                    StatRow(icon: "memorychip.fill", label: "Latest Memory", value: viewModel.memoryUsage, iconColor: .indigo)
+                }
+            }
+
+            GlassCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack {
+                        DashboardPanelHeader(
+                            title: "Markdown Report Preview",
+                            subtitle: "Live preview of the report saved in Application Support."
+                        )
+
+                        Spacer()
+
+                        HStack(spacing: 10) {
+                            Button {
+                                viewModel.openLatestReport()
+                            } label: {
+                                Label("Open Report", systemImage: "doc.text")
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button {
+                                viewModel.revealHistoryFolder()
+                            } label: {
+                                Label("Reveal Files", systemImage: "folder")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
+                    ScrollView {
+                        Text(viewModel.latestReportText)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(14)
+                    }
+                    .frame(minHeight: 320)
+                    .background {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.primary.opacity(0.045))
+                    }
+                }
+            }
+        }
+    }
+
+    private var historySummaryCard: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                DashboardPanelHeader(
+                    title: "Monitoring history",
+                    subtitle: historySubtitle
+                )
+
+                StatRow(icon: "square.and.arrow.down", label: "Last Saved", value: viewModel.lastHistorySave, iconColor: .green)
+                StatRow(icon: "doc.text.magnifyingglass", label: "Report Updated", value: viewModel.lastReportGenerated, iconColor: .orange)
+
+                Text(viewModel.latestReportText)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                    .background {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.primary.opacity(0.045))
+                    }
+            }
+        }
+    }
+
+    private func sidebarSubtitle(for section: DashboardSection) -> String {
+        switch section {
+        case .overview:
+            return healthSummary.subtitle
+        case .performance:
+            return "\(viewModel.cpuUsage) CPU • \(memoryPercent) memory"
+        case .power:
+            return "\(viewModel.powerUsage) • \(viewModel.powerSource)"
+        case .network:
+            return "\(viewModel.downloadSpeed) down • \(viewModel.uploadSpeed) up"
+        case .history:
+            return historySubtitle
+        }
+    }
+
+    private func sectionAccentColor(for section: DashboardSection) -> Color {
+        switch section {
+        case .overview:
+            return .teal
+        case .performance:
+            return .blue
+        case .power:
+            return .orange
+        case .network:
+            return .cyan
+        case .history:
+            return .green
+        }
+    }
+
+    private func toneColor(for tone: DashboardTone) -> Color {
+        switch tone {
+        case .nominal:
+            return .teal
+        case .elevated:
+            return .orange
+        case .critical:
+            return .red
+        }
+    }
+
+    private func percentage(from text: String) -> Double? {
+        let cleaned = text
+            .replacingOccurrences(of: "%", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Double(cleaned)
+    }
+
+    private func reconcileSelection() {
+        guard !filteredSections.isEmpty else {
+            selectedSection = nil
+            return
+        }
+
+        if let selectedSection, filteredSections.contains(selectedSection) {
+            return
+        }
+
+        selectedSection = filteredSections.first
+    }
+}
+
+private struct DashboardSidebarStatusCard: View {
+    let summary: DashboardHealthSummary
+    let hostName: String
+    let macOSVersion: String
+    let historySubtitle: String
+    let accentColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(accentColor.opacity(0.16))
+                        .frame(width: 34, height: 34)
+
+                    Image(systemName: "gauge.with.dots.needle.67percent")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(accentColor)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(summary.title)
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(hostName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Text(summary.subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text(macOSVersion)
+                .font(.caption2)
+                .foregroundStyle(accentColor)
+
+            Text(historySubtitle)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(.regularMaterial)
+        }
+    }
+}
+
+private struct DashboardSidebarSectionRow: View {
+    let section: DashboardSection
+    let subtitle: String
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: section.symbolName)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(accentColor)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(section.title)
+                    .font(.system(size: 13, weight: .semibold))
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct DashboardHeroCard: View {
+    let summary: DashboardHealthSummary
+    let hostName: String
+    let macOSVersion: String
+    let cpuModel: String
+    let gpuName: String
+    let historySubtitle: String
+    let lastSaved: String
+    let accentColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 18) {
+                    heading
+                    facts
+                }
+
+                VStack(alignment: .leading, spacing: 18) {
+                    heading
+                    facts
+                }
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(summary.highlights, id: \.self) { highlight in
+                        Text(highlight)
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background {
+                                Capsule()
+                                    .fill(Color.white.opacity(0.22))
+                            }
+                    }
+                }
+            }
+        }
+        .padding(22)
+        .background {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            accentColor.opacity(0.22),
+                            Color.teal.opacity(0.08),
+                            Color.orange.opacity(0.12)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(.thinMaterial.opacity(0.55))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                }
+        }
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("System Monitor")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Text(summary.title)
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+
+            Text(summary.subtitle)
+                .font(.system(size: 14))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var facts: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            DashboardFactPill(label: "Host", value: hostName, accentColor: accentColor)
+            DashboardFactPill(label: "macOS", value: macOSVersion, accentColor: .blue)
+            DashboardFactPill(label: "CPU", value: cpuModel, accentColor: .indigo)
+            DashboardFactPill(label: "GPU", value: gpuName, accentColor: .mint)
+            DashboardFactPill(label: "History", value: historySubtitle, accentColor: .green)
+            DashboardFactPill(label: "Last Save", value: lastSaved, accentColor: .orange)
+        }
+        .frame(maxWidth: 360, alignment: .leading)
+    }
+}
+
+private struct DashboardFactPill: View {
+    let label: String
+    let value: String
+    let accentColor: Color
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(accentColor)
+                .frame(width: 62, alignment: .leading)
+
+            Text(value)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.18))
+        }
+    }
+}
+
+private struct DashboardSectionHeader: View {
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+
+            Text(subtitle)
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct DashboardPanelHeader: View {
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+
+            Text(subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct DashboardGaugeCard: View {
+    let title: String
+    let subtitle: String
+    let value: Double
+    let label: String
+    let valueText: String
+    let icon: String
+    let colors: [Color]
+
+    var body: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 14) {
+                DashboardPanelHeader(title: title, subtitle: subtitle)
+
+                HStack {
+                    Spacer(minLength: 0)
+                    CircularGaugeView(
+                        value: value,
+                        label: label,
+                        valueText: valueText,
+                        icon: icon,
+                        gradientColors: colors
+                    )
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+    }
+}
+
+private struct DashboardFactsCard<Content: View>: View {
+    let title: String
+    let subtitle: String
+    let content: Content
+
+    init(
+        title: String,
+        subtitle: String,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.content = content()
+    }
+
+    var body: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                DashboardPanelHeader(title: title, subtitle: subtitle)
+                content
+            }
         }
     }
 }

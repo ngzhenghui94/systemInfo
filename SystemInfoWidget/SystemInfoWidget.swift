@@ -112,11 +112,6 @@ struct WidgetStatRow: View {
 struct SmallWidgetView: View {
     let entry: SystemInfoEntry
     
-    private var cpuValue: Double {
-        let cleaned = entry.snapshot.cpuUsage.replacingOccurrences(of: "%", with: "")
-        return (Double(cleaned) ?? 0) / 100.0
-    }
-    
     private var diskPercent: String {
         String(format: "%.0f%%", entry.snapshot.diskUsagePercent * 100)
     }
@@ -157,22 +152,13 @@ struct SmallWidgetView: View {
                 Spacer()
             }
             
-            // Two gauges side by side
-            HStack(spacing: 12) {
-                WidgetMiniGauge(
-                    value: cpuValue,
-                    icon: "cpu",
-                    label: entry.snapshot.cpuUsage,
-                    colors: [.blue, .cyan]
-                )
-                
-                WidgetMiniGauge(
-                    value: entry.snapshot.diskUsagePercent,
-                    icon: "internaldrive",
-                    label: diskPercent,
-                    colors: [.orange, .yellow]
-                )
-            }
+            // Disk gauge centered
+            WidgetMiniGauge(
+                value: entry.snapshot.diskUsagePercent,
+                icon: "internaldrive",
+                label: diskPercent,
+                colors: [.orange, .yellow]
+            )
             
             // Quick stats
             VStack(spacing: 2) {
@@ -199,18 +185,13 @@ struct SmallWidgetView: View {
 struct MediumWidgetView: View {
     let entry: SystemInfoEntry
     
-    private var cpuValue: Double {
-        let cleaned = entry.snapshot.cpuUsage.replacingOccurrences(of: "%", with: "")
-        return (Double(cleaned) ?? 0) / 100.0
-    }
-    
     private var diskPercent: String {
         String(format: "%.0f%%", entry.snapshot.diskUsagePercent * 100)
     }
     
     var body: some View {
         HStack(spacing: 16) {
-            // Left side - Header and gauges
+            // Left side - Header and gauge
             VStack(alignment: .leading, spacing: 10) {
                 // Header
                 HStack(spacing: 6) {
@@ -246,22 +227,13 @@ struct MediumWidgetView: View {
                 
                 Spacer()
                 
-                // Gauges row - CPU and Disk
-                HStack(spacing: 16) {
-                    WidgetMiniGauge(
-                        value: cpuValue,
-                        icon: "cpu",
-                        label: entry.snapshot.cpuUsage,
-                        colors: [.blue, .cyan]
-                    )
-                    
-                    WidgetMiniGauge(
-                        value: entry.snapshot.diskUsagePercent,
-                        icon: "internaldrive",
-                        label: diskPercent,
-                        colors: [.orange, .yellow]
-                    )
-                }
+                // Disk gauge
+                WidgetMiniGauge(
+                    value: entry.snapshot.diskUsagePercent,
+                    icon: "internaldrive",
+                    label: diskPercent,
+                    colors: [.orange, .yellow]
+                )
             }
             
             // Right side - Stats
@@ -280,10 +252,10 @@ struct MediumWidgetView: View {
                 
                 VStack(spacing: 5) {
                     WidgetStatRow(
-                        icon: "cpu",
-                        label: "CPU",
-                        value: entry.snapshot.cpuUsage,
-                        iconColor: .blue
+                        icon: "memorychip",
+                        label: "Memory",
+                        value: entry.snapshot.memoryUsage,
+                        iconColor: .purple
                     )
                     
                     WidgetStatRow(
