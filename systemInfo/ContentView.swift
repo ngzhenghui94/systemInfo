@@ -896,6 +896,36 @@ struct NetworkSpeedBar: View {
     }
 }
 
+enum TrendTimeWindow: String, CaseIterable, Identifiable {
+    case oneMinute = "1m"
+    case fiveMinutes = "5m"
+    case fifteenMinutes = "15m"
+    case thirtyMinutes = "30m"
+    case oneHour = "1hr"
+    case fourHours = "4hr"
+    case eightHours = "8hr"
+    case twelveHours = "12hr"
+    case oneDay = "1 day"
+
+    var id: String { rawValue }
+
+    var label: String { rawValue }
+
+    var sampleLimit: Int {
+        switch self {
+        case .oneMinute: return 60
+        case .fiveMinutes: return 300
+        case .fifteenMinutes: return 900
+        case .thirtyMinutes: return 1800
+        case .oneHour: return 3600
+        case .fourHours: return 14400
+        case .eightHours: return 28800
+        case .twelveHours: return 43200
+        case .oneDay: return 86400
+        }
+    }
+}
+
 // MARK: - Main Content View
 
 struct ContentView: View {
@@ -903,6 +933,7 @@ struct ContentView: View {
     @State private var selectedSection: DashboardSection? = .overview
     @State private var searchText: String = ""
     @State private var showResetConfirmation = false
+    @AppStorage("trendTimeWindow") private var selectedTrendWindow: TrendTimeWindow = .fiveMinutes
 
     private var cpuPercent: Double? {
         percentage(from: viewModel.cpuUsage)
@@ -1016,15 +1047,15 @@ struct ContentView: View {
     }
 
     private var displayedTrendSamples: [SystemHistorySample] {
-        DashboardPresentationBuilder.recentSamples(viewModel.historySamples)
+        DashboardPresentationBuilder.recentSamples(viewModel.historySamples, limit: selectedTrendWindow.sampleLimit)
     }
 
     private var powerReportTrendCards: [DashboardTrendCardModel] {
-        DashboardPresentationBuilder.powerTrendCards(from: viewModel.historySamples)
+        DashboardPresentationBuilder.powerTrendCards(from: viewModel.historySamples, limit: selectedTrendWindow.sampleLimit)
     }
 
     private var resourceTrendCards: [DashboardTrendCardModel] {
-        DashboardPresentationBuilder.resourceTrendCards(from: viewModel.historySamples)
+        DashboardPresentationBuilder.resourceTrendCards(from: viewModel.historySamples, limit: selectedTrendWindow.sampleLimit)
     }
 
     private var trendWindowSubtitle: String {
@@ -1581,10 +1612,24 @@ struct ContentView: View {
         let report = viewModel.powerUsageReport
 
         return VStack(alignment: .leading, spacing: 16) {
-            DashboardSectionHeader(
-                title: "Trend analysis",
-                subtitle: "Visual charts for power, memory, CPU load, and bandwidth across recent samples."
-            )
+            HStack(alignment: .top) {
+                DashboardSectionHeader(
+                    title: "Trend analysis",
+                    subtitle: "Visual charts for power, memory, CPU load, and bandwidth across recent samples."
+                )
+                
+                Spacer()
+                
+                Picker("", selection: $selectedTrendWindow) {
+                    ForEach(TrendTimeWindow.allCases) { window in
+                        Text(window.label).tag(window)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 100)
+                .padding(.trailing, 14)
+                .padding(.top, 10)
+            }
 
             GlassCard {
                 VStack(alignment: .leading, spacing: 16) {
