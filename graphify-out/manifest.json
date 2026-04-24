@@ -1,0 +1,21 @@
+{
+  "Tests/PowerTelemetryTests.swift": 1776957477.327979,
+  "Tests/MonitoringHistoryTests.swift": 1776939339.315437,
+  "Tests/DashboardPresentationTests.swift": 1776961116.2907085,
+  "Tests/NetworkDetailsTests.swift": 1776874215.3991292,
+  "Tests/PowerUsageReportTests.swift": 1776939099.506903,
+  "SystemInfoWidget/SystemInfoWidget.swift": 1765979189.0,
+  "SystemInfoWidget/SystemInfoWidgetBundle.swift": 1765287553.0,
+  "SystemInfoWidget/AppIntent.swift": 1765287443.0,
+  "SystemInfoWidget/WidgetSystemInfoModel.swift": 1765979107.0,
+  "systemInfo/MonitoringHistory.swift": 1776939078.3372357,
+  "systemInfo/PowerUsageReport.swift": 1776939396.427928,
+  "systemInfo/NetworkDetails.swift": 1776874491.2558737,
+  "systemInfo/PowerTelemetry.swift": 1776962760.2743917,
+  "systemInfo/SystemInfoModel.swift": 1765287443.0,
+  "systemInfo/DashboardPresentation.swift": 1776961154.203355,
+  "systemInfo/systemInfoApp.swift": 1776862529.3340158,
+  "systemInfo/ContentView.swift": 1776962251.3544266,
+  "terminals/1.txt": 1765287526.0,
+  "systemInfo/Assets.xcassets/AppIcon.appiconset/systemInfo.png": 1765978604.0
+}

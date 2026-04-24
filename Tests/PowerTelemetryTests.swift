@@ -13,6 +13,7 @@ struct PowerTelemetryTests {
     static func main() {
         testSystemPowerPrefersScopedTelemetry()
         testChargeRateOnlyShowsWhenCharging()
+        testBatteryHealthFallsBackToConditionWhenPresent()
         print("Power telemetry tests passed")
     }
 
@@ -55,6 +56,7 @@ struct PowerTelemetryTests {
             kIOPSMaxCapacityKey as String: 84.0,
             kIOPSPowerSourceStateKey as String: kIOPSBatteryPowerValue,
             kIOPSIsChargingKey as String: false,
+            kIOPSBatteryHealthKey as String: kIOPSGoodValue,
             kIOPSVoltageKey as String: 12_000.0,
             kIOPSCurrentKey as String: -900.0
         ]
@@ -69,5 +71,26 @@ struct PowerTelemetryTests {
         expect(snapshot.systemPowerText == "—", "system power should stay unavailable without scoped telemetry")
         expect(snapshot.chargeRateText == "—", "charge rate should not show during discharge")
         expect(snapshot.powerMetricKind == nil, "unscoped samples should not be marked as system power")
+        expect(snapshot.batteryHealthText == "Good", "battery health should come from the public IOPS health key")
+    }
+
+    private static func testBatteryHealthFallsBackToConditionWhenPresent() {
+        let description: [String: Any] = [
+            kIOPSCurrentCapacityKey as String: 60.0,
+            kIOPSMaxCapacityKey as String: 100.0,
+            kIOPSPowerSourceStateKey as String: kIOPSACPowerValue,
+            kIOPSBatteryHealthKey as String: kIOPSGoodValue,
+            kIOPSBatteryHealthConditionKey as String: kIOPSCheckBatteryValue
+        ]
+
+        let snapshot = PowerTelemetryParser.snapshot(
+            powerSourceDescription: description,
+            batteryRegistryProperties: nil
+        )
+
+        expect(
+            snapshot.batteryHealthText == "Check Battery",
+            "battery health should prefer a more specific battery condition when one is present"
+        )
     }
 }

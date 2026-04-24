@@ -73,7 +73,9 @@ struct SystemHistoryOverview {
 final class SystemHistoryStore {
     let baseDirectoryURL: URL
     let historyURL: URL
-    let reportURL: URL
+    let powerReportURL: URL
+
+    var reportURL: URL { powerReportURL }
 
     private let fileManager: FileManager
     private let retentionLimit: Int
@@ -91,7 +93,7 @@ final class SystemHistoryStore {
         let resolvedBaseDirectoryURL = baseDirectoryURL ?? Self.defaultBaseDirectoryURL(fileManager: fileManager)
         self.baseDirectoryURL = resolvedBaseDirectoryURL
         self.historyURL = resolvedBaseDirectoryURL.appendingPathComponent("system-stats-history.json")
-        self.reportURL = resolvedBaseDirectoryURL.appendingPathComponent("latest-system-report.md")
+        self.powerReportURL = resolvedBaseDirectoryURL.appendingPathComponent("latest-power-usage-report.md")
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -129,25 +131,34 @@ final class SystemHistoryStore {
         try save(samples)
 
         if shouldGenerateReport {
-            let report = SystemReportGenerator.generate(from: samples, generatedAt: generatedAt ?? sample.capturedAt)
-            try saveReport(report)
+            let report = PowerUsageReportGenerator.generate(from: samples, generatedAt: generatedAt ?? sample.capturedAt)
+            try savePowerReport(report)
         }
 
         return samples
     }
 
     @discardableResult
-    func refreshReport(using samples: [SystemHistorySample], generatedAt: Date = Date()) throws -> String {
-        let report = SystemReportGenerator.generate(from: samples, generatedAt: generatedAt)
-        try saveReport(report)
+    func refreshPowerReport(using samples: [SystemHistorySample], generatedAt: Date = Date()) throws -> String {
+        let report = PowerUsageReportGenerator.generate(from: samples, generatedAt: generatedAt)
+        try savePowerReport(report)
         return report
     }
 
-    func loadReport() throws -> String? {
-        guard fileManager.fileExists(atPath: reportURL.path) else {
+    @discardableResult
+    func refreshReport(using samples: [SystemHistorySample], generatedAt: Date = Date()) throws -> String {
+        try refreshPowerReport(using: samples, generatedAt: generatedAt)
+    }
+
+    func loadPowerReport() throws -> String? {
+        guard fileManager.fileExists(atPath: powerReportURL.path) else {
             return nil
         }
-        return try String(contentsOf: reportURL, encoding: .utf8)
+        return try String(contentsOf: powerReportURL, encoding: .utf8)
+    }
+
+    func loadReport() throws -> String? {
+        try loadPowerReport()
     }
 
     func overview(for samples: [SystemHistorySample]) -> SystemHistoryOverview {
@@ -158,14 +169,23 @@ final class SystemHistoryStore {
         )
     }
 
+    /// Deletes all persisted history and the cached power report from disk.
+    func clearHistory() throws {
+        for url in [historyURL, powerReportURL] {
+            if fileManager.fileExists(atPath: url.path) {
+                try fileManager.removeItem(at: url)
+            }
+        }
+    }
+
     private func save(_ samples: [SystemHistorySample]) throws {
         let data = try encoder.encode(samples)
         try data.write(to: historyURL, options: .atomic)
     }
 
-    private func saveReport(_ report: String) throws {
+    private func savePowerReport(_ report: String) throws {
         try ensureBaseDirectoryExists()
-        try report.write(to: reportURL, atomically: true, encoding: .utf8)
+        try report.write(to: powerReportURL, atomically: true, encoding: .utf8)
     }
 
     private func ensureBaseDirectoryExists() throws {
@@ -181,204 +201,6 @@ final class SystemHistoryStore {
 
 enum SystemReportGenerator {
     static func generate(from samples: [SystemHistorySample], generatedAt: Date = Date()) -> String {
-        guard !samples.isEmpty else {
-            return """
-            # System Monitoring Report
-
-            Generated: \(format(date: generatedAt))
-            Samples stored: 0
-
-            No historical samples have been captured yet.
-            """
-        }
-
-        let sortedSamples = samples.sorted { $0.capturedAt < $1.capturedAt }
-        let latestSample = sortedSamples[sortedSamples.count - 1]
-        let overview = SystemHistoryOverview(
-            sampleCount: sortedSamples.count,
-            firstCapturedAt: sortedSamples.first?.capturedAt,
-            lastCapturedAt: sortedSamples.last?.capturedAt
-        )
-
-        var lines: [String] = [
-            "# System Monitoring Report",
-            "",
-            "Generated: \(format(date: generatedAt))",
-            "Samples stored: \(sortedSamples.count)",
-            "Range: \(format(date: sortedSamples[0].capturedAt)) -> \(format(date: latestSample.capturedAt))",
-            "Coverage: \(overview.coverageText)",
-            "",
-            "## Current Snapshot",
-            "- Host: \(latestSample.hostName)",
-            "- macOS: \(latestSample.macOSVersion)",
-            "- CPU: \(latestSample.cpuModel) (\(latestSample.cpuCores))",
-            "- GPU: \(latestSample.gpuName)",
-            "- Uptime: \(latestSample.uptimeText)",
-            "- Thermal state: \(latestSample.thermalState)",
-            "- Power source: \(latestSample.powerSource)"
-        ]
-
-        if let powerMetricSource = latestSample.powerMetricSource,
-           latestSample.powerMetricKind == .systemPower {
-            lines.append("- System power source: \(powerMetricSource)")
-        }
-
-        lines.append("- System power: \(latestSample.powerUsageText)")
-        lines.append("- Battery level: \(latestSample.batteryLevelText)")
-        lines.append("- Free memory: \(latestSample.freeMemoryText)")
-        lines.append("- Disk free: \(latestSample.freeDiskSpaceText) of \(latestSample.totalDiskSpaceText)")
-        lines.append("- Wi-Fi: \(latestSample.wifiNetwork)")
-        lines.append("- IP address: \(latestSample.ipAddress)")
-        lines.append("")
-        lines.append("## Resource Trends")
-
-        if let summary = summarize(sortedSamples.compactMap(\.cpuUsagePercent)) {
-            lines.append("- CPU usage: \(formatPercentageSummary(summary))")
-        }
-        if let summary = summarize(memoryPercents(from: sortedSamples)) {
-            lines.append("- Memory usage: \(formatPercentageSummary(summary))")
-        }
-        if let summary = summarize(sortedSamples.compactMap(\.diskUsagePercent).map { $0 * 100 }) {
-            lines.append("- Disk usage: \(formatPercentageSummary(summary))")
-        }
-        if let summary = summarize(sortedSamples.compactMap(\.batteryLevelPercent)) {
-            lines.append("- Battery level: \(formatPercentageSummary(summary))")
-        }
-        let scopedSystemPowerSamples = sortedSamples.filter { $0.powerMetricKind == .systemPower }
-        if let summary = summarize(scopedSystemPowerSamples.compactMap(\.powerUsageWatts)) {
-            lines.append("- System power: \(formatWattSummary(summary))")
-        }
-        // Historical reports may contain legacy battery-flow samples from before
-        // the metric was scoped. Exclude them so new system-power trends stay honest.
-        let excludedLegacyPowerSampleCount = sortedSamples.filter {
-            $0.powerUsageWatts != nil && $0.powerMetricKind != .systemPower
-        }.count
-        if excludedLegacyPowerSampleCount > 0 {
-            lines.append("- Legacy or unscoped power samples excluded from system-power trend: \(excludedLegacyPowerSampleCount)")
-        }
-        if let summary = summarize(sortedSamples.compactMap(\.downloadBytesPerSecond)) {
-            lines.append("- Download throughput: \(formatTransferSummary(summary))")
-        }
-        if let summary = summarize(sortedSamples.compactMap(\.uploadBytesPerSecond)) {
-            lines.append("- Upload throughput: \(formatTransferSummary(summary))")
-        }
-
-        lines.append("")
-        lines.append("## Environment Observations")
-        lines.append("- Thermal states observed: \(summarizeCounts(sortedSamples.map(\.thermalState)))")
-        lines.append("- Power sources observed: \(summarizeCounts(sortedSamples.map(\.powerSource)))")
-        lines.append("- Wi-Fi networks observed: \(summarizeCounts(sortedSamples.map(\.wifiNetwork)))")
-
-        return lines.joined(separator: "\n")
-    }
-
-    private struct NumericSummary {
-        let average: Double
-        let minimum: Double
-        let maximum: Double
-        let latest: Double
-    }
-
-    private static func memoryPercents(from samples: [SystemHistorySample]) -> [Double] {
-        samples.compactMap { sample in
-            guard let used = sample.memoryUsedGB, let total = sample.memoryTotalGB, total > 0 else {
-                return nil
-            }
-            return (used / total) * 100
-        }
-    }
-
-    private static func summarize(_ values: [Double]) -> NumericSummary? {
-        guard let firstValue = values.first else {
-            return nil
-        }
-
-        var total = 0.0
-        var minimum = firstValue
-        var maximum = firstValue
-
-        for value in values {
-            total += value
-            minimum = min(minimum, value)
-            maximum = max(maximum, value)
-        }
-
-        return NumericSummary(
-            average: total / Double(values.count),
-            minimum: minimum,
-            maximum: maximum,
-            latest: values[values.count - 1]
-        )
-    }
-
-    private static func summarizeCounts(_ values: [String]) -> String {
-        let filteredValues = values
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && $0 != "—" }
-
-        guard !filteredValues.isEmpty else {
-            return "No observations"
-        }
-
-        let counts = filteredValues.reduce(into: [String: Int]()) { partialResult, value in
-            partialResult[value, default: 0] += 1
-        }
-
-        return counts
-            .sorted { lhs, rhs in
-                if lhs.key == rhs.key {
-                    return lhs.value < rhs.value
-                }
-                return lhs.key < rhs.key
-            }
-            .map { "\($0.key) (\($0.value))" }
-            .joined(separator: ", ")
-    }
-
-    private static func formatPercentageSummary(_ summary: NumericSummary) -> String {
-        String(
-            format: "avg %.1f%%, min %.1f%%, max %.1f%%, latest %.1f%%",
-            summary.average,
-            summary.minimum,
-            summary.maximum,
-            summary.latest
-        )
-    }
-
-    private static func formatWattSummary(_ summary: NumericSummary) -> String {
-        String(
-            format: "avg %.1f W, min %.1f W, max %.1f W, latest %.1f W",
-            summary.average,
-            summary.minimum,
-            summary.maximum,
-            summary.latest
-        )
-    }
-
-    private static func formatTransferSummary(_ summary: NumericSummary) -> String {
-        "avg \(format(bytesPerSecond: summary.average)), max \(format(bytesPerSecond: summary.maximum)), latest \(format(bytesPerSecond: summary.latest))"
-    }
-
-    private static func format(bytesPerSecond: Double) -> String {
-        guard bytesPerSecond > 0 else {
-            return "0 B/s"
-        }
-
-        let units = ["B/s", "KB/s", "MB/s", "GB/s"]
-        var value = bytesPerSecond
-        var index = 0
-
-        while value >= 1024 && index < units.count - 1 {
-            value /= 1024
-            index += 1
-        }
-
-        return String(format: "%.1f %@", value, units[index])
-    }
-
-    private static func format(date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.string(from: date)
+        PowerUsageReportGenerator.generate(from: samples, generatedAt: generatedAt)
     }
 }

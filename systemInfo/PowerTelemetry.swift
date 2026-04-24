@@ -8,6 +8,7 @@ enum PowerMetricKind: String, Codable {
 
 struct PowerTelemetrySnapshot: Equatable {
     let batteryLevelText: String
+    let batteryHealthText: String
     let powerSource: String
     let systemPowerText: String
     let systemPowerWatts: Double?
@@ -18,6 +19,7 @@ struct PowerTelemetrySnapshot: Equatable {
 
     static let unavailable = PowerTelemetrySnapshot(
         batteryLevelText: "—",
+        batteryHealthText: "—",
         powerSource: "No battery",
         systemPowerText: "—",
         systemPowerWatts: nil,
@@ -29,24 +31,26 @@ struct PowerTelemetrySnapshot: Equatable {
 }
 
 enum PowerTelemetryParser {
-    static let systemPowerSourceKey = "AppleSmartBattery/BatteryData.SystemPower"
+    static let systemPowerSourceKey    = "AppleSmartBattery/BatteryData.SystemPower"
+    static let systemLoadSourceKey     = "AppleSmartBattery/PowerTelemetryData.SystemLoad"
 
     static func snapshot(
         powerSourceDescription: [String: Any],
         batteryRegistryProperties: [String: Any]?
     ) -> PowerTelemetrySnapshot {
-        let systemPowerWatts = systemPowerWatts(from: batteryRegistryProperties)
+        let powerResult    = systemPowerResult(from: batteryRegistryProperties)
         let chargeRateWatts = chargeRateWatts(from: powerSourceDescription)
 
         return PowerTelemetrySnapshot(
             batteryLevelText: batteryLevelText(from: powerSourceDescription),
+            batteryHealthText: batteryHealthText(from: powerSourceDescription),
             powerSource: powerSourceText(from: powerSourceDescription),
-            systemPowerText: formattedWatts(systemPowerWatts),
-            systemPowerWatts: systemPowerWatts,
+            systemPowerText: formattedWatts(powerResult?.watts),
+            systemPowerWatts: powerResult?.watts,
             chargeRateText: formattedWatts(chargeRateWatts),
             chargeRateWatts: chargeRateWatts,
-            powerMetricKind: systemPowerWatts == nil ? nil : .systemPower,
-            powerMetricSource: systemPowerWatts == nil ? nil : systemPowerSourceKey
+            powerMetricKind: powerResult == nil ? nil : .systemPower,
+            powerMetricSource: powerResult?.source
         )
     }
 
@@ -72,15 +76,48 @@ enum PowerTelemetryParser {
         return state ?? "Unknown"
     }
 
-    private static func systemPowerWatts(from batteryRegistryProperties: [String: Any]?) -> Double? {
-        // Prefer the controller's scoped system-power telemetry. The public
-        // IOPS voltage/current pair only tells us battery terminal flow.
-        guard let batteryRegistryProperties,
-              let watts = number(at: ["BatteryData", "SystemPower"], in: batteryRegistryProperties),
-              watts > 0.1 else {
-            return nil
+    private static func batteryHealthText(from description: [String: Any]) -> String {
+        let condition = string(from: description[kIOPSBatteryHealthConditionKey as String])
+        if let condition, !condition.isEmpty {
+            return condition
         }
-        return watts
+
+        if let health = string(from: description[kIOPSBatteryHealthKey as String]),
+           !health.isEmpty {
+            return health
+        }
+
+        return "—"
+    }
+
+    /// Returns the system power consumption in watts plus the IOKit key path that
+    /// provided the reading, or nil when no valid sample is available.
+    ///
+    /// All power fields in AppleSmartBattery are reported in **milliwatts**;
+    /// this function divides by 1 000 before returning.
+    ///
+    /// Sources tried in order:
+    ///  1. `BatteryData.SystemPower`         – scoped controller telemetry, active during
+    ///                                         battery discharge; often empty on AC.
+    ///  2. `PowerTelemetryData.SystemLoad`   – total system consumption, available on
+    ///                                         both battery and AC.
+    private static func systemPowerResult(
+        from batteryRegistryProperties: [String: Any]?
+    ) -> (watts: Double, source: String)? {
+        guard let props = batteryRegistryProperties else { return nil }
+
+        let candidates: [([String], String)] = [
+            (["BatteryData", "SystemPower"],       systemPowerSourceKey),
+            (["PowerTelemetryData", "SystemLoad"], systemLoadSourceKey),
+        ]
+
+        for (keyPath, source) in candidates {
+            // Ignore values ≤ 100 mW — they are noise or uninitialized zeroes.
+            if let mw = number(at: keyPath, in: props), mw > 100 {
+                return (mw / 1000.0, source)
+            }
+        }
+        return nil
     }
 
     private static func chargeRateWatts(from description: [String: Any]) -> Double? {
@@ -128,6 +165,19 @@ enum PowerTelemetryParser {
             return Double(value)
         case let value as Float:
             return Double(value)
+        default:
+            return nil
+        }
+    }
+
+    private static func string(from value: Any?) -> String? {
+        switch value {
+        case let value as String:
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        case let value as NSString:
+            let trimmed = String(value).trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
         default:
             return nil
         }

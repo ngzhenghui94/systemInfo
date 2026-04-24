@@ -6,6 +6,7 @@ enum DashboardSection: String, CaseIterable, Identifiable {
     case power
     case network
     case history
+    case trends
 
     var id: String { rawValue }
 
@@ -21,6 +22,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
             return "Network"
         case .history:
             return "History & Report"
+        case .trends:
+            return "Trends"
         }
     }
 
@@ -36,6 +39,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
             return "network"
         case .history:
             return "clock.arrow.trianglehead.counterclockwise.rotate.90"
+        case .trends:
+            return "chart.line.uptrend.xyaxis"
         }
     }
 
@@ -51,6 +56,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
             return ["wifi", "download", "upload", "ip", "throughput"]
         case .history:
             return ["history", "report", "timeline", "samples", "saved"]
+        case .trends:
+            return ["power", "report", "history", "trend", "export", "watt", "memory", "cpu", "load", "network", "bandwidth"]
         }
     }
 
@@ -66,6 +73,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
             return "Connection details and real-time throughput."
         case .history:
             return "Saved monitoring data and the generated Markdown report."
+        case .trends:
+            return "Trend summaries and charts based on the stored monitoring history."
         }
     }
 }
@@ -81,6 +90,74 @@ struct DashboardHealthSummary {
     let title: String
     let subtitle: String
     let highlights: [String]
+}
+
+enum DashboardTrendMetric: String, CaseIterable, Identifiable {
+    case cpuUsage
+    case cpuLoad
+    case memoryUsage
+    case batteryLevel
+    case systemPower
+    case downloadRate
+    case uploadRate
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .cpuUsage:
+            return "CPU Usage"
+        case .cpuLoad:
+            return "CPU Load"
+        case .memoryUsage:
+            return "Memory Usage"
+        case .batteryLevel:
+            return "Battery Level"
+        case .systemPower:
+            return "System Power"
+        case .downloadRate:
+            return "Download"
+        case .uploadRate:
+            return "Upload"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .cpuUsage:
+            return "Processor activity across the visible history window."
+        case .cpuLoad:
+            return "One-minute load average captured with each saved sample."
+        case .memoryUsage:
+            return "Used memory as a share of installed RAM."
+        case .batteryLevel:
+            return "Battery reserve over the recent capture window."
+        case .systemPower:
+            return "Whole-system watt draw from Apple battery telemetry."
+        case .downloadRate:
+            return "Inbound throughput for the recent captured samples."
+        case .uploadRate:
+            return "Outbound throughput for the recent captured samples."
+        }
+    }
+}
+
+struct DashboardTrendPoint: Equatable, Identifiable {
+    let timestamp: Date
+    let value: Double
+
+    var id: Date { timestamp }
+}
+
+struct DashboardTrendCardModel: Equatable, Identifiable {
+    let metric: DashboardTrendMetric
+    let title: String
+    let subtitle: String
+    let currentValueText: String
+    let deltaText: String
+    let points: [DashboardTrendPoint]
+
+    var id: DashboardTrendMetric { metric }
 }
 
 enum DashboardPresentationBuilder {
@@ -140,6 +217,8 @@ enum DashboardPresentationBuilder {
         case .history:
             let noun = sampleCount == 1 ? "sample" : "samples"
             return "\(sampleCount) \(noun) · \(coverageText)"
+        case .trends:
+            return "Charts and deltas for recent samples"
         }
     }
 
@@ -210,6 +289,86 @@ enum DashboardPresentationBuilder {
         )
     }
 
+    static func recentSamples(_ samples: [SystemHistorySample], limit: Int = 60) -> [SystemHistorySample] {
+        guard limit > 0 else {
+            return []
+        }
+        return Array(samples.suffix(limit))
+    }
+
+    static func trendWindowSubtitle(totalSampleCount: Int, displayedSampleCount: Int) -> String {
+        guard totalSampleCount > 0, displayedSampleCount > 0 else {
+            return "Charts will appear after enough saved samples accumulate."
+        }
+
+        if displayedSampleCount >= totalSampleCount {
+            return "Showing all \(totalSampleCount) saved samples."
+        }
+
+        return "Showing the latest \(displayedSampleCount) of \(totalSampleCount) saved samples."
+    }
+
+    static func trendCards(from samples: [SystemHistorySample], limit: Int = 60) -> [DashboardTrendCardModel] {
+        filteredTrendCards(
+            from: samples,
+            metrics: Set(DashboardTrendMetric.allCases),
+            limit: limit
+        )
+    }
+
+    static func powerTrendCards(from samples: [SystemHistorySample], limit: Int = 60) -> [DashboardTrendCardModel] {
+        filteredTrendCards(
+            from: samples,
+            metrics: [.batteryLevel, .systemPower],
+            limit: limit
+        )
+    }
+
+    static func resourceTrendCards(from samples: [SystemHistorySample], limit: Int = 60) -> [DashboardTrendCardModel] {
+        filteredTrendCards(
+            from: samples,
+            metrics: [.cpuUsage, .cpuLoad, .memoryUsage, .downloadRate, .uploadRate],
+            limit: limit
+        )
+    }
+
+    private static func filteredTrendCards(
+        from samples: [SystemHistorySample],
+        metrics: Set<DashboardTrendMetric>,
+        limit: Int
+    ) -> [DashboardTrendCardModel] {
+        let displayedSamples = recentSamples(samples, limit: limit)
+
+        return DashboardTrendMetric.allCases.compactMap { metric in
+            guard metrics.contains(metric) else {
+                return nil
+            }
+
+            let points = displayedSamples.compactMap { sample -> DashboardTrendPoint? in
+                guard let value = trendValue(for: metric, from: sample) else {
+                    return nil
+                }
+
+                return DashboardTrendPoint(timestamp: sample.capturedAt, value: value)
+            }
+
+            guard points.count >= 2,
+                  let firstValue = points.first?.value,
+                  let latestValue = points.last?.value else {
+                return nil
+            }
+
+            return DashboardTrendCardModel(
+                metric: metric,
+                title: metric.title,
+                subtitle: metric.subtitle,
+                currentValueText: formatTrendValue(latestValue, metric: metric),
+                deltaText: formatTrendDelta(latest: latestValue, baseline: firstValue, metric: metric),
+                points: points
+            )
+        }
+    }
+
     private static func compactRate(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         switch true {
@@ -224,5 +383,78 @@ enum DashboardPresentationBuilder {
         default:
             return trimmed
         }
+    }
+
+    private static func trendValue(for metric: DashboardTrendMetric, from sample: SystemHistorySample) -> Double? {
+        switch metric {
+        case .cpuUsage:
+            return sample.cpuUsagePercent
+        case .cpuLoad:
+            return sample.loadAverageOneMinute
+        case .memoryUsage:
+            guard let used = sample.memoryUsedGB, let total = sample.memoryTotalGB, total > 0 else {
+                return nil
+            }
+            return (used / total) * 100
+        case .batteryLevel:
+            return sample.batteryLevelPercent
+        case .systemPower:
+            guard sample.powerMetricKind == .systemPower else {
+                return nil
+            }
+            return sample.powerUsageWatts
+        case .downloadRate:
+            return sample.downloadBytesPerSecond
+        case .uploadRate:
+            return sample.uploadBytesPerSecond
+        }
+    }
+
+    private static func formatTrendValue(_ value: Double, metric: DashboardTrendMetric) -> String {
+        switch metric {
+        case .cpuUsage, .memoryUsage, .batteryLevel:
+            return String(format: "%.0f%%", value)
+        case .cpuLoad:
+            return String(format: "%.2f", value)
+        case .systemPower:
+            return String(format: "%.1f W", value)
+        case .downloadRate, .uploadRate:
+            return formatRate(value)
+        }
+    }
+
+    private static func formatTrendDelta(latest: Double, baseline: Double, metric: DashboardTrendMetric) -> String {
+        let delta = latest - baseline
+        switch metric {
+        case .cpuUsage, .memoryUsage, .batteryLevel:
+            return String(format: "%+.0f pts", delta)
+        case .cpuLoad:
+            return String(format: "%+.2f", delta)
+        case .systemPower:
+            return String(format: "%+.1f W", delta)
+        case .downloadRate, .uploadRate:
+            return formatSignedRate(delta)
+        }
+    }
+
+    private static func formatRate(_ bytesPerSecond: Double) -> String {
+        guard bytesPerSecond > 0 else { return "0 B/s" }
+        let units = ["B/s", "KB/s", "MB/s", "GB/s"]
+        var value = bytesPerSecond
+        var index = 0
+        while value >= 1024, index < units.count - 1 {
+            value /= 1024
+            index += 1
+        }
+        return String(format: "%.1f %@", value, units[index])
+    }
+
+    private static func formatSignedRate(_ bytesPerSecond: Double) -> String {
+        if bytesPerSecond == 0 {
+            return "0 B/s"
+        }
+
+        let sign = bytesPerSecond >= 0 ? "+" : "-"
+        return sign + formatRate(abs(bytesPerSecond))
     }
 }

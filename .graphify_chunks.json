@@ -1,0 +1,25 @@
+[
+  [
+    "SystemInfoWidget/SystemInfoWidget.swift",
+    "SystemInfoWidget/SystemInfoWidgetBundle.swift",
+    "SystemInfoWidget/AppIntent.swift",
+    "SystemInfoWidget/WidgetSystemInfoModel.swift",
+    "Tests/PowerTelemetryTests.swift",
+    "Tests/MonitoringHistoryTests.swift",
+    "Tests/DashboardPresentationTests.swift",
+    "Tests/NetworkDetailsTests.swift",
+    "Tests/PowerUsageReportTests.swift",
+    "systemInfo/MonitoringHistory.swift",
+    "systemInfo/PowerUsageReport.swift",
+    "systemInfo/NetworkDetails.swift",
+    "systemInfo/PowerTelemetry.swift",
+    "systemInfo/SystemInfoModel.swift",
+    "systemInfo/DashboardPresentation.swift",
+    "systemInfo/systemInfoApp.swift",
+    "systemInfo/ContentView.swift",
+    "terminals/1.txt"
+  ],
+  [
+    "systemInfo/Assets.xcassets/AppIcon.appiconset/systemInfo.png"
+  ]
+]

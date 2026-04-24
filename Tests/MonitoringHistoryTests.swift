@@ -129,12 +129,15 @@ struct MonitoringHistoryTests {
 
         let report = SystemReportGenerator.generate(from: samples, generatedAt: makeDate(2026, 4, 22, 3, 0))
 
-        expect(report.contains("# System Monitoring Report"), "report header missing")
+        expect(report.contains("# Power Usage Report"), "report header missing")
         expect(report.contains("Samples stored: 3"), "sample count missing")
+        expect(report.contains("System-power samples: 3"), "system-power sample count missing")
         expect(report.contains("Coverage: 2h 0m"), "coverage summary missing")
-        expect(report.contains("System power: avg 11.0 W, min 8.0 W, max 14.0 W, latest 11.0 W"), "system power summary incorrect")
-        expect(report.contains("Thermal states observed: Fair (1), Normal (2)"), "thermal state aggregation incorrect")
-        expect(report.contains("Power sources observed: AC Power (1), Battery (2)"), "power source aggregation incorrect")
+        expect(report.contains("- Average system power: 11.0 W"), "average system power summary incorrect")
+        expect(report.contains("- Peak system power: 14.0 W"), "peak system power summary incorrect")
+        expect(report.contains("- Latest system power: 11.0 W"), "latest system power summary incorrect")
+        expect(report.contains("- Power source mix: AC Power 33% (1), Battery 67% (2)"), "power source mix summary incorrect")
+        expect(report.contains("| Timestamp | System Power | Battery | Source |"), "peak moments table missing")
     }
 
     private static func testReportExcludesLegacyUnscopedPowerSamples() throws {
@@ -170,11 +173,11 @@ struct MonitoringHistoryTests {
         let report = SystemReportGenerator.generate(from: samples, generatedAt: makeDate(2026, 4, 22, 2, 0))
 
         expect(
-            report.contains("System power: avg 10.0 W, min 10.0 W, max 10.0 W, latest 10.0 W"),
+            report.contains("- Average system power: 10.0 W"),
             "legacy unscoped power samples should be excluded from the system-power trend"
         )
         expect(
-            report.contains("Legacy or unscoped power samples excluded from system-power trend: 1"),
+            report.contains("Excluded legacy or unscoped power samples: 1"),
             "report should call out excluded legacy power samples"
         )
     }

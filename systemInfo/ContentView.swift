@@ -6,9 +6,11 @@
 //
 
 import SwiftUI
+import Charts
 import Combine
 import Darwin
 import AppKit
+import UniformTypeIdentifiers
 
 /// View model that gathers and formats system information for display.
 final class SystemInfoViewModel: ObservableObject {
@@ -43,7 +45,9 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var historyCoverage: String = "0m"
     @Published var lastHistorySave: String = "—"
     @Published var lastReportGenerated: String = "—"
-    @Published var latestReportText: String = "Historical samples will appear here once the app captures them."
+    @Published var latestReportText: String = "Power usage history will appear here once the app captures scoped system-power samples."
+    @Published var historySamples: [SystemHistorySample] = []
+    @Published var powerUsageReport: PowerUsageReportSnapshot = .empty
 
     private let networkMonitor = NetworkMonitor()
     private let historyStore = SystemHistoryStore()
@@ -53,7 +57,11 @@ final class SystemInfoViewModel: ObservableObject {
     private var latestUploadBytesPerSecond: Double = 0
     private var currentPowerSnapshot: PowerTelemetrySnapshot = .unavailable
 
-    private let historySaveInterval: TimeInterval = 60
+    private let historySaveInterval: TimeInterval = 1
+    private let updateQueue = DispatchQueue(label: "com.systemInfo.update", qos: .utility)
+    private var cachedTotalDiskBytes: Int64 = 0
+    private var tickCount = 0
+    private var isRefreshing = false
 
     init() {
         updateStaticInfo()
@@ -72,16 +80,21 @@ final class SystemInfoViewModel: ObservableObject {
         macOSVersion = "macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
 
         hostName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-        freeDiskSpace = Self.format(bytes: getFreeDiskSpaceBytes())
-        memoryUsage = Self.memoryUsageSummary()
+        let (memUsage, freeMemValue) = Self.vmMemorySummaries()
+        memoryUsage = memUsage
+        freeMemory = freeMemValue
         updatePowerInfo()
-        
-        // New static info
+
         cpuModel = Self.getCPUModel()
         cpuCores = Self.getCPUCores()
         gpuName = Self.getGPUName()
-        totalDiskSpace = Self.format(bytes: getTotalDiskSpaceBytes())
-        updateDiskUsage()
+        cachedTotalDiskBytes = getTotalDiskSpaceBytes()
+        totalDiskSpace = Self.format(bytes: cachedTotalDiskBytes)
+        let freeBytes = getFreeDiskSpaceBytes()
+        freeDiskSpace = Self.format(bytes: freeBytes)
+        diskUsagePercent = cachedTotalDiskBytes > 0
+            ? Double(cachedTotalDiskBytes - freeBytes) / Double(cachedTotalDiskBytes)
+            : 0
     }
 
     /// Info that should refresh regularly (uptime, network speeds).
@@ -96,37 +109,68 @@ final class SystemInfoViewModel: ObservableObject {
     }
 
     private func updateDynamicInfo(forcePersist: Bool = false) {
-        let now = Date()
-        uptime = Self.format(uptimeSeconds: ProcessInfo.processInfo.systemUptime)
+        tickCount += 1
+        let tick = tickCount
+        guard !isRefreshing else { return }
+        isRefreshing = true
 
-        memoryUsage = Self.memoryUsageSummary()
-        cpuUsage = Self.cpuUsageSummary()
-        loadAverage = Self.loadAverageSummary()
+        let capturedAt = Date()
+        let force = forcePersist
+        let totalDisk = cachedTotalDiskBytes
 
-        updatePowerInfo()
+        updateQueue.async { [weak self] in
+            guard let self else { return }
 
-        let speeds = networkMonitor.currentSpeeds()
-        latestDownloadBytesPerSecond = speeds.download
-        latestUploadBytesPerSecond = speeds.upload
-        downloadSpeed = Self.format(bytesPerSecond: speeds.download)
-        uploadSpeed = Self.format(bytesPerSecond: speeds.upload)
-        
-        // New dynamic info
-        thermalState = Self.getThermalState()
-        ipAddress = NetworkDetailsResolver.currentIPv4Address()
-        wifiNetwork = NetworkDetailsResolver.currentWiFiSSID()
-        freeMemory = Self.getFreeMemory()
-        updateDiskUsage()
-        persistHistoryIfNeeded(capturedAt: now, force: forcePersist)
-    }
-    
-    private func updateDiskUsage() {
-        let total = getTotalDiskSpaceBytes()
-        let free = getFreeDiskSpaceBytes()
-        if total > 0 {
-            diskUsagePercent = Double(total - free) / Double(total)
+            let uptimeValue = Self.format(uptimeSeconds: ProcessInfo.processInfo.systemUptime)
+            let (memUsage, freeMemValue) = Self.vmMemorySummaries()
+            let cpuValue = Self.cpuUsageSummary()
+            let loadValue = Self.loadAverageSummary()
+            let thermal = Self.getThermalState()
+
+            let speeds = self.networkMonitor.currentSpeeds()
+            let dlBps = speeds.download
+            let ulBps = speeds.upload
+
+            let freeBytes = self.getFreeDiskSpaceBytes()
+            let diskPct = totalDisk > 0 ? Double(totalDisk - freeBytes) / Double(totalDisk) : 0
+
+            // IOKit battery — every 5 s
+            let newPowerSnap: PowerTelemetrySnapshot? = tick % 5 == 1
+                ? PowerTelemetryResolver.currentSnapshot()
+                : nil
+
+            // SCDynamicStore WiFi + IP — every 15 s
+            let newIP: String? = tick % 15 == 1 ? NetworkDetailsResolver.currentIPv4Address() : nil
+            let newWifi: String? = tick % 15 == 1 ? NetworkDetailsResolver.currentWiFiSSID() : nil
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.uptime = uptimeValue
+                self.memoryUsage = memUsage
+                self.freeMemory = freeMemValue
+                self.cpuUsage = cpuValue
+                self.loadAverage = loadValue
+                self.thermalState = thermal
+                self.latestDownloadBytesPerSecond = dlBps
+                self.latestUploadBytesPerSecond = ulBps
+                self.downloadSpeed = Self.format(bytesPerSecond: dlBps)
+                self.uploadSpeed = Self.format(bytesPerSecond: ulBps)
+                self.diskUsagePercent = diskPct
+                self.freeDiskSpace = Self.format(bytes: freeBytes)
+                if let snap = newPowerSnap {
+                    self.currentPowerSnapshot = snap
+                    self.batteryLevel = snap.batteryLevelText
+                    self.batteryHealth = snap.batteryHealthText
+                    self.powerSource = snap.powerSource
+                    self.powerUsage = snap.systemPowerText
+                    self.chargingWattage = snap.chargeRateText
+                }
+                if let ip = newIP { self.ipAddress = ip }
+                if let wifi = newWifi { self.wifiNetwork = wifi }
+                self.isRefreshing = false
+                self.persistHistoryIfNeeded(capturedAt: capturedAt, force: force)
+            }
         }
-        freeDiskSpace = Self.format(bytes: free)
     }
 
     private func getFreeDiskSpaceBytes() -> Int64 {
@@ -138,7 +182,9 @@ final class SystemInfoViewModel: ObservableObject {
         return 0
     }
 
-    private static func memoryUsageSummary() -> String {
+    /// Single `host_statistics64` call that produces both the "used/total" and "available/total"
+    /// memory strings, avoiding the duplicate Mach IPC that the old separate functions incurred.
+    private static func vmMemorySummaries() -> (usage: String, free: String) {
         let totalBytes = Double(ProcessInfo.processInfo.physicalMemory)
 
         var stats = vm_statistics64()
@@ -149,27 +195,27 @@ final class SystemInfoViewModel: ObservableObject {
             }
         }
 
-        guard result == KERN_SUCCESS else { return "—" }
+        guard result == KERN_SUCCESS else { return ("—", "—") }
 
         var pageSize: vm_size_t = 0
         host_page_size(mach_host_self(), &pageSize)
 
         let freeBytes = Double(stats.free_count) * Double(pageSize)
-        // Treat inactive + speculative pages as cache (similar to Activity Monitor's "Cached Files")
         let cacheBytes = Double(stats.inactive_count + stats.speculative_count) * Double(pageSize)
         let usedBytes = max(totalBytes - freeBytes - cacheBytes, 0)
+        let availableBytes = freeBytes + cacheBytes
 
-        let usedGB = usedBytes / 1024 / 1024 / 1024
-        let totalGB = totalBytes / 1024 / 1024 / 1024
-
-        // Show "used / total GB"
-        return String(format: "%.1f / %.1f GB", usedGB, totalGB)
+        let totalGB = totalBytes / 1_073_741_824
+        let usage = String(format: "%.1f / %.1f GB", usedBytes / 1_073_741_824, totalGB)
+        let free  = String(format: "%.1f / %.1f GB", availableBytes / 1_073_741_824, totalGB)
+        return (usage, free)
     }
 
     private func updatePowerInfo() {
         let snapshot = PowerTelemetryResolver.currentSnapshot()
         currentPowerSnapshot = snapshot
         batteryLevel = snapshot.batteryLevelText
+        batteryHealth = snapshot.batteryHealthText
         powerSource = snapshot.powerSource
         powerUsage = snapshot.systemPowerText
         chargingWattage = snapshot.chargeRateText
@@ -347,41 +393,17 @@ final class SystemInfoViewModel: ObservableObject {
         }
     }
     
-    private static func getFreeMemory() -> String {
-        var stats = vm_statistics64()
-        var count = mach_msg_type_number_t(MemoryLayout.size(ofValue: stats) / MemoryLayout<integer_t>.size)
-        let result = withUnsafeMutablePointer(to: &stats) { ptr -> kern_return_t in
-            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, intPtr, &count)
-            }
-        }
-        
-        guard result == KERN_SUCCESS else { return "—" }
-        
-        var pageSize: vm_size_t = 0
-        host_page_size(mach_host_self(), &pageSize)
-        
-        let totalBytes = Double(ProcessInfo.processInfo.physicalMemory)
-        let freeBytes = Double(stats.free_count) * Double(pageSize)
-        let cacheBytes = Double(stats.inactive_count + stats.speculative_count) * Double(pageSize)
-        let availableBytes = freeBytes + cacheBytes
-        
-        let availableGB = availableBytes / 1024 / 1024 / 1024
-        let totalGB = totalBytes / 1024 / 1024 / 1024
-        
-        return String(format: "%.1f / %.1f GB", availableGB, totalGB)
-    }
-
     private func hydrateHistory() {
         do {
             let samples = try historyStore.loadSamples()
             updateHistoryMetadata(with: samples)
+            updatePowerReportSummary(with: samples)
 
-            if let report = try historyStore.loadReport() {
+            if let report = try historyStore.loadPowerReport() {
                 latestReportText = report
-                lastReportGenerated = Self.format(timestamp: samples.last?.capturedAt)
+                lastReportGenerated = Self.format(timestamp: Date())
             } else if !samples.isEmpty {
-                let report = try historyStore.refreshReport(using: samples, generatedAt: Date())
+                let report = try historyStore.refreshPowerReport(using: samples, generatedAt: Date())
                 latestReportText = report
                 lastReportGenerated = Self.format(timestamp: Date())
             }
@@ -397,19 +419,21 @@ final class SystemInfoViewModel: ObservableObject {
 
         do {
             let samples = try historyStore.record(currentHistorySample(capturedAt: capturedAt))
-            let report = try historyStore.refreshReport(using: samples, generatedAt: capturedAt)
+            let report = try historyStore.refreshPowerReport(using: samples, generatedAt: capturedAt)
 
             lastPersistedAt = capturedAt
             lastHistorySave = Self.format(timestamp: capturedAt)
             lastReportGenerated = Self.format(timestamp: capturedAt)
             latestReportText = report
             updateHistoryMetadata(with: samples)
+            updatePowerReportSummary(with: samples)
         } catch {
             latestReportText = "Unable to persist monitoring history: \(error.localizedDescription)"
         }
     }
 
     private func updateHistoryMetadata(with samples: [SystemHistorySample]) {
+        historySamples = samples
         let overview = historyStore.overview(for: samples)
         historySampleCount = overview.sampleCount
         historyCoverage = overview.coverageText
@@ -417,6 +441,10 @@ final class SystemInfoViewModel: ObservableObject {
         if let lastCapturedAt = samples.last?.capturedAt, lastHistorySave == "—" {
             lastHistorySave = Self.format(timestamp: lastCapturedAt)
         }
+    }
+
+    private func updatePowerReportSummary(with samples: [SystemHistorySample]) {
+        powerUsageReport = PowerUsageReportBuilder.build(from: samples)
     }
 
     private func currentHistorySample(capturedAt: Date) -> SystemHistorySample {
@@ -451,7 +479,7 @@ final class SystemInfoViewModel: ObservableObject {
             freeDiskSpaceText: freeDiskSpace,
             freeDiskBytes: getFreeDiskSpaceBytes(),
             totalDiskSpaceText: totalDiskSpace,
-            totalDiskBytes: getTotalDiskSpaceBytes(),
+            totalDiskBytes: cachedTotalDiskBytes,
             diskUsagePercent: diskUsagePercent,
             downloadSpeedText: downloadSpeed,
             downloadBytesPerSecond: latestDownloadBytesPerSecond,
@@ -474,6 +502,66 @@ final class SystemInfoViewModel: ObservableObject {
             ? historyStore.reportURL
             : historyStore.baseDirectoryURL
         NSWorkspace.shared.activateFileViewerSelecting([targetURL])
+    }
+
+    func regeneratePowerReport() {
+        do {
+            let samples = try historyStore.loadSamples()
+            updateHistoryMetadata(with: samples)
+            updatePowerReportSummary(with: samples)
+
+            let generatedAt = Date()
+            let report = try historyStore.refreshPowerReport(using: samples, generatedAt: generatedAt)
+            latestReportText = report
+            lastReportGenerated = Self.format(timestamp: generatedAt)
+        } catch {
+            latestReportText = "Unable to generate power report: \(error.localizedDescription)"
+        }
+    }
+
+    func exportPowerReport() {
+        do {
+            let samples = try historyStore.loadSamples()
+            updateHistoryMetadata(with: samples)
+            updatePowerReportSummary(with: samples)
+
+            let generatedAt = Date()
+            let report = try historyStore.refreshPowerReport(using: samples, generatedAt: generatedAt)
+            latestReportText = report
+            lastReportGenerated = Self.format(timestamp: generatedAt)
+
+            let savePanel = NSSavePanel()
+            savePanel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+            savePanel.canCreateDirectories = true
+            savePanel.nameFieldStringValue = Self.exportReportFileName(for: generatedAt)
+
+            guard savePanel.runModal() == .OK, let destinationURL = savePanel.url else {
+                return
+            }
+
+            try report.write(to: destinationURL, atomically: true, encoding: .utf8)
+            NSWorkspace.shared.activateFileViewerSelecting([destinationURL])
+        } catch {
+            latestReportText = "Unable to export power report: \(error.localizedDescription)"
+        }
+    }
+
+    func resetHistory() {
+        do {
+            try historyStore.clearHistory()
+        } catch {
+            latestReportText = "Unable to reset history: \(error.localizedDescription)"
+            return
+        }
+
+        lastPersistedAt = nil
+        historySamples = []
+        historySampleCount = 0
+        historyCoverage = "0m"
+        lastHistorySave = "—"
+        lastReportGenerated = "—"
+        powerUsageReport = .empty
+        latestReportText = "History cleared. New samples will appear here once the app captures scoped system-power readings."
     }
 
     private static func parsePercent(from text: String) -> Double? {
@@ -510,14 +598,27 @@ final class SystemInfoViewModel: ObservableObject {
         return (oneMinute, fiveMinute)
     }
 
-    private static func format(timestamp: Date?) -> String {
-        guard let timestamp else {
-            return "—"
-        }
+    private static let timestampFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("MMM d h:mm a")
+        return f
+    }()
 
-        let formatter = DateFormatter()
-        formatter.setLocalizedDateFormatFromTemplate("MMM d h:mm a")
-        return formatter.string(from: timestamp)
+    private static let exportFilenameFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .autoupdatingCurrent
+        f.dateFormat = "yyyy-MM-dd-HHmm"
+        return f
+    }()
+
+    private static func format(timestamp: Date?) -> String {
+        guard let timestamp else { return "—" }
+        return timestampFormatter.string(from: timestamp)
+    }
+
+    private static func exportReportFileName(for date: Date) -> String {
+        return "power-usage-report-\(exportFilenameFormatter.string(from: date)).md"
     }
 }
 
@@ -801,6 +902,7 @@ struct ContentView: View {
     @StateObject private var viewModel = SystemInfoViewModel()
     @State private var selectedSection: DashboardSection? = .overview
     @State private var searchText: String = ""
+    @State private var showResetConfirmation = false
 
     private var cpuPercent: Double? {
         percentage(from: viewModel.cpuUsage)
@@ -910,6 +1012,25 @@ struct ContentView: View {
         DashboardPresentationBuilder.historySubtitle(
             sampleCount: viewModel.historySampleCount,
             coverageText: viewModel.historyCoverage
+        )
+    }
+
+    private var displayedTrendSamples: [SystemHistorySample] {
+        DashboardPresentationBuilder.recentSamples(viewModel.historySamples)
+    }
+
+    private var powerReportTrendCards: [DashboardTrendCardModel] {
+        DashboardPresentationBuilder.powerTrendCards(from: viewModel.historySamples)
+    }
+
+    private var resourceTrendCards: [DashboardTrendCardModel] {
+        DashboardPresentationBuilder.resourceTrendCards(from: viewModel.historySamples)
+    }
+
+    private var trendWindowSubtitle: String {
+        DashboardPresentationBuilder.trendWindowSubtitle(
+            totalSampleCount: viewModel.historySampleCount,
+            displayedSampleCount: displayedTrendSamples.count
         )
     }
 
@@ -1029,6 +1150,8 @@ struct ContentView: View {
             networkSection(availableWidth: availableWidth)
         case .history:
             historySection(availableWidth: availableWidth)
+        case .trends:
+            trendsSection(availableWidth: availableWidth)
         }
     }
 
@@ -1202,6 +1325,7 @@ struct ContentView: View {
                     minHeight: 196
                 ) {
                     StatRow(icon: "battery.100", label: "Battery Level", value: viewModel.batteryLevel, iconColor: batteryGradient.first ?? .green)
+                    StatRow(icon: "heart.text.square", label: "Battery Health", value: viewModel.batteryHealth, iconColor: .mint)
                     StatRow(icon: "powerplug", label: "Power Source", value: viewModel.powerSource, iconColor: .yellow)
                     StatRow(icon: "bolt.badge.clock", label: "System Power", value: viewModel.powerUsage, iconColor: .pink)
                     StatRow(icon: "bolt.fill", label: "Battery Charge Rate", value: viewModel.chargingWattage, iconColor: .orange)
@@ -1261,34 +1385,116 @@ struct ContentView: View {
 
     private func historySection(availableWidth: CGFloat) -> some View {
         let columns = gridColumns(for: availableWidth, minimumCardWidth: 360, maxColumns: 2)
+        let report = viewModel.powerUsageReport
 
         return VStack(alignment: .leading, spacing: 16) {
             DashboardSectionHeader(
-                title: "Historical monitoring",
-                subtitle: "Every current stat is persisted periodically and summarized into a Markdown report that you can open or share."
+                title: "Monitoring history",
+                subtitle: "Saved samples are summarized here so you can review power, memory, CPU load, and bandwidth trends from local data."
             )
 
             LazyVGrid(columns: columns, spacing: 16) {
                 DashboardFactsCard(
-                    title: "Capture Status",
-                    subtitle: "Persistence cadence and recent write activity.",
+                    title: "Report Overview",
+                    subtitle: "Scoped power readings derived from the saved monitoring history.",
                     minHeight: 188
                 ) {
                     StatRow(icon: "clock.badge.checkmark", label: "Save Cadence", value: "Every 1 min", iconColor: .blue)
-                    StatRow(icon: "externaldrive.badge.timemachine", label: "Samples Stored", value: "\(viewModel.historySampleCount)", iconColor: .mint)
-                    StatRow(icon: "timeline.selection", label: "Coverage", value: viewModel.historyCoverage, iconColor: .teal)
+                    StatRow(icon: "externaldrive.badge.timemachine", label: "Saved Samples", value: "\(viewModel.historySampleCount)", iconColor: .mint)
+                    StatRow(icon: "bolt.badge.clock", label: "Power Samples", value: "\(report.powerSampleCount)", iconColor: .pink)
+                    StatRow(icon: "timeline.selection", label: "Coverage", value: report.coverageText, iconColor: .teal)
                     StatRow(icon: "square.and.arrow.down", label: "Last Saved", value: viewModel.lastHistorySave, iconColor: .green)
                 }
 
                 DashboardFactsCard(
-                    title: "Report",
-                    subtitle: "Generated from the saved history.",
+                    title: "Power Summary",
+                    subtitle: "Quick read on the stored power window.",
                     minHeight: 188
                 ) {
                     StatRow(icon: "doc.text.magnifyingglass", label: "Report Updated", value: viewModel.lastReportGenerated, iconColor: .orange)
-                    StatRow(icon: "bolt.badge.clock", label: "Latest System Power", value: viewModel.powerUsage, iconColor: .pink)
-                    StatRow(icon: "waveform.path.ecg", label: "Latest CPU", value: viewModel.cpuUsage, iconColor: .blue)
-                    StatRow(icon: "memorychip.fill", label: "Latest Memory", value: viewModel.memoryUsage, iconColor: .indigo)
+                    StatRow(icon: "bolt.fill", label: "Average Draw", value: formattedWatts(report.averageWatts), iconColor: .pink)
+                    StatRow(icon: "waveform.path.ecg", label: "Peak Draw", value: formattedWatts(report.maximumWatts), iconColor: .red)
+                    StatRow(icon: "arrow.forward.to.line", label: "Latest Draw", value: formattedWatts(report.latestWatts), iconColor: .orange)
+                }
+
+                DashboardFactsCard(
+                    title: "Battery & Trend",
+                    subtitle: "How the saved power window moved over time.",
+                    minHeight: 188
+                ) {
+                    StatRow(icon: "chart.line.uptrend.xyaxis", label: "Trend", value: trendText(for: report), iconColor: trendColor(for: report))
+                    StatRow(icon: "arrow.left.and.right", label: "Trend Delta", value: formattedSignedWatts(report.trendDeltaWatts), iconColor: trendColor(for: report))
+                    StatRow(icon: "battery.75", label: "Avg Battery", value: formattedPercent(report.averageBatteryPercent), iconColor: .green)
+                    StatRow(icon: "battery.25", label: "Battery Delta", value: formattedSignedPercent(report.batteryDeltaPercent), iconColor: .yellow)
+                }
+
+                DashboardFactsCard(
+                    title: "Source Mix",
+                    subtitle: "Power sources seen in the scoped history.",
+                    minHeight: 188
+                ) {
+                    if report.powerSourceBreakdown.isEmpty {
+                        StatRow(icon: "powerplug", label: "Sources", value: "Need more saved power samples", iconColor: .secondary)
+                    } else {
+                        ForEach(report.powerSourceBreakdown) { source in
+                            StatRow(
+                                icon: source.label == "AC Power" ? "powerplug.fill" : "battery.100",
+                                label: source.label,
+                                value: String(format: "%.0f%% · %d", source.share * 100, source.count),
+                                iconColor: source.label == "AC Power" ? .yellow : .green
+                            )
+                        }
+                    }
+                }
+            }
+
+            GlassCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    DashboardPanelHeader(
+                        title: "Peak Moments",
+                        subtitle: "Highest recorded system-power readings from the saved local history."
+                    )
+
+                    if report.peakMoments.isEmpty {
+                        ContentUnavailableView(
+                            "No Peak Moments Yet",
+                            systemImage: "bolt.slash",
+                            description: Text("Scoped system-power samples will populate this list automatically as they are saved.")
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 160)
+                    } else {
+                        VStack(spacing: 10) {
+                            ForEach(report.peakMoments) { moment in
+                                HStack(spacing: 12) {
+                                    Text(PowerUsageReportBuilder.displayTimestamp(for: moment.capturedAt, includeDate: true))
+                                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 130, alignment: .leading)
+
+                                    Text(String(format: "%.1f W", moment.watts))
+                                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                                        .monospacedDigit()
+                                        .frame(width: 86, alignment: .leading)
+
+                                    Text(moment.batteryLevelPercent.map { String(format: "%.0f%%", $0) } ?? "—")
+                                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 54, alignment: .leading)
+
+                                    Text(moment.powerSource)
+                                        .font(.caption.weight(.semibold))
+                                        .foregroundStyle(moment.powerSource == "AC Power" ? .yellow : .green)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 10)
+                                .background {
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .fill(Color.primary.opacity(0.04))
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1296,19 +1502,33 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack {
                         DashboardPanelHeader(
-                            title: "Markdown Report Preview",
-                            subtitle: "Live preview of the report saved in Application Support."
+                            title: "Markdown Artifact",
+                            subtitle: "Generate, preview, and export the saved power usage report."
                         )
 
                         Spacer()
 
                         HStack(spacing: 10) {
                             Button {
+                                viewModel.regeneratePowerReport()
+                            } label: {
+                                Label("Generate", systemImage: "arrow.clockwise")
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button {
+                                viewModel.exportPowerReport()
+                            } label: {
+                                Label("Export", systemImage: "square.and.arrow.up")
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button {
                                 viewModel.openLatestReport()
                             } label: {
                                 Label("Open Report", systemImage: "doc.text")
                             }
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(.bordered)
 
                             Button {
                                 viewModel.revealHistoryFolder()
@@ -1316,6 +1536,25 @@ struct ContentView: View {
                                 Label("Reveal Files", systemImage: "folder")
                             }
                             .buttonStyle(.bordered)
+
+                            Button(role: .destructive) {
+                                showResetConfirmation = true
+                            } label: {
+                                Label("Reset History", systemImage: "trash")
+                            }
+                            .buttonStyle(.bordered)
+                            .confirmationDialog(
+                                "Reset all monitoring history?",
+                                isPresented: $showResetConfirmation,
+                                titleVisibility: .visible
+                            ) {
+                                Button("Reset History", role: .destructive) {
+                                    viewModel.resetHistory()
+                                }
+                                Button("Cancel", role: .cancel) {}
+                            } message: {
+                                Text("This permanently deletes all saved samples and the power report. New data will be collected immediately.")
+                            }
                         }
                     }
 
@@ -1337,14 +1576,76 @@ struct ContentView: View {
         }
     }
 
+    private func trendsSection(availableWidth: CGFloat) -> some View {
+        let chartColumns = gridColumns(for: availableWidth, minimumCardWidth: 320, maxColumns: 3)
+        let report = viewModel.powerUsageReport
+
+        return VStack(alignment: .leading, spacing: 16) {
+            DashboardSectionHeader(
+                title: "Trend analysis",
+                subtitle: "Visual charts for power, memory, CPU load, and bandwidth across recent samples."
+            )
+
+            GlassCard {
+                VStack(alignment: .leading, spacing: 16) {
+                    DashboardPanelHeader(
+                        title: "Power Trends",
+                        subtitle: powerTrendSubtitle(report: report)
+                    )
+
+                    if powerReportTrendCards.isEmpty {
+                        ContentUnavailableView(
+                            "Power Trends Need More History",
+                            systemImage: "bolt.badge.clock",
+                            description: Text("Keep the app open long enough to capture a couple of scoped system-power samples and the report charts will populate here.")
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 220)
+                    } else {
+                        LazyVGrid(columns: chartColumns, spacing: 16) {
+                            ForEach(powerReportTrendCards) { card in
+                                DashboardTrendCard(card: card)
+                            }
+                        }
+                    }
+                }
+            }
+
+            GlassCard {
+                VStack(alignment: .leading, spacing: 16) {
+                    DashboardPanelHeader(
+                        title: "Resource Trends",
+                        subtitle: resourceTrendSubtitle
+                    )
+
+                    if resourceTrendCards.isEmpty {
+                        ContentUnavailableView(
+                            "Resource Trends Need More History",
+                            systemImage: "chart.xyaxis.line",
+                            description: Text("Keep the app open long enough to capture a couple of saved samples and the memory, CPU load, and bandwidth charts will populate here.")
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 220)
+                    } else {
+                        LazyVGrid(columns: chartColumns, spacing: 16) {
+                            ForEach(resourceTrendCards) { card in
+                                DashboardTrendCard(card: card)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private var historySummaryCard: some View {
         DashboardFactsCard(
-            title: "Monitoring history",
+            title: "Power report",
             subtitle: historySubtitle,
             minHeight: 228
         ) {
             StatRow(icon: "square.and.arrow.down", label: "Last Saved", value: viewModel.lastHistorySave, iconColor: .green)
             StatRow(icon: "doc.text.magnifyingglass", label: "Report Updated", value: viewModel.lastReportGenerated, iconColor: .orange)
+            StatRow(icon: "bolt.badge.clock", label: "Power Samples", value: "\(viewModel.powerUsageReport.powerSampleCount)", iconColor: .pink)
+            StatRow(icon: "chart.line.uptrend.xyaxis", label: "Avg Draw", value: formattedWatts(viewModel.powerUsageReport.averageWatts), iconColor: .teal)
 
             Text(viewModel.latestReportText)
                 .font(.system(size: 11, design: .monospaced))
@@ -1399,6 +1700,8 @@ struct ContentView: View {
             return .cyan
         case .history:
             return .green
+        case .trends:
+            return .indigo
         }
     }
 
@@ -1418,6 +1721,80 @@ struct ContentView: View {
             .replacingOccurrences(of: "%", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return Double(cleaned)
+    }
+
+    private func formattedWatts(_ watts: Double?) -> String {
+        guard let watts else {
+            return "—"
+        }
+        return String(format: "%.1f W", watts)
+    }
+
+    private func formattedPercent(_ percent: Double?) -> String {
+        guard let percent else {
+            return "—"
+        }
+        return String(format: "%.1f%%", percent)
+    }
+
+    private func formattedSignedPercent(_ percent: Double?) -> String {
+        guard let percent else {
+            return "—"
+        }
+        return percent >= 0
+            ? String(format: "+%.1f%%", percent)
+            : String(format: "%.1f%%", percent)
+    }
+
+    private func formattedSignedWatts(_ watts: Double?) -> String {
+        guard let watts else {
+            return "—"
+        }
+        return watts >= 0
+            ? String(format: "+%.1f W", watts)
+            : String(format: "%.1f W", watts)
+    }
+
+    private func trendText(for report: PowerUsageReportSnapshot) -> String {
+        report.trendDirection.title
+    }
+
+    private func trendColor(for report: PowerUsageReportSnapshot) -> Color {
+        switch report.trendDirection {
+        case .rising:
+            return .orange
+        case .falling:
+            return .teal
+        case .stable:
+            return .blue
+        case .unavailable:
+            return .secondary
+        }
+    }
+
+    private func powerTrendSubtitle(report: PowerUsageReportSnapshot) -> String {
+        guard report.powerSampleCount > 0 else {
+            return "Charts will appear after enough scoped system-power history accumulates."
+        }
+
+        if powerReportTrendCards.isEmpty {
+            return "Saved samples exist, but the report needs more scoped power points to draw the charts."
+        }
+
+        let noun = report.powerSampleCount == 1 ? "sample" : "samples"
+        return "Showing \(report.powerSampleCount) scoped power \(noun) across \(report.coverageText)."
+    }
+
+    private var resourceTrendSubtitle: String {
+        guard viewModel.historySampleCount > 0 else {
+            return "Charts will appear after enough saved history accumulates."
+        }
+
+        if resourceTrendCards.isEmpty {
+            return "Saved samples exist, but more history is needed before memory, CPU load, and bandwidth trends can be drawn."
+        }
+
+        return trendWindowSubtitle
     }
 
     private func reconcileSelection() {
@@ -1702,6 +2079,205 @@ private struct DashboardPanelHeader: View {
                 .lineLimit(2)
         }
         .frame(maxWidth: .infinity, minHeight: 38, alignment: .topLeading)
+    }
+}
+
+private struct DashboardTrendCard: View {
+    let card: DashboardTrendCardModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Label(card.title, systemImage: symbolName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(accentColor)
+
+                    Text(card.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 8)
+
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text(card.currentValueText)
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+
+                    Text(card.deltaText)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(deltaColor)
+                }
+            }
+
+            Chart(card.points) { point in
+                if usesAreaFill {
+                    AreaMark(
+                        x: .value("Captured At", point.timestamp),
+                        y: .value("Value", point.value)
+                    )
+                    .foregroundStyle(accentColor.opacity(0.14))
+                }
+
+                LineMark(
+                    x: .value("Captured At", point.timestamp),
+                    y: .value("Value", point.value)
+                )
+                .foregroundStyle(accentColor)
+                .lineStyle(StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+                .interpolationMethod(.catmullRom)
+
+                if point.id == card.points.last?.id {
+                    PointMark(
+                        x: .value("Captured At", point.timestamp),
+                        y: .value("Value", point.value)
+                    )
+                    .foregroundStyle(accentColor)
+                    .symbolSize(44)
+                }
+            }
+            .chartXAxis {
+                AxisMarks(values: .automatic(desiredCount: 4)) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2, 4]))
+                        .foregroundStyle(Color.secondary.opacity(0.18))
+                    AxisTick(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(Color.secondary.opacity(0.28))
+                    AxisValueLabel {
+                        if let date = value.as(Date.self) {
+                            Text(date, format: .dateTime.hour().minute())
+                        }
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .chartYAxis {
+                AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { value in
+                    AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5))
+                        .foregroundStyle(Color.secondary.opacity(0.14))
+                    AxisValueLabel {
+                        if let yValue = value.as(Double.self) {
+                            Text(axisLabel(for: yValue))
+                        }
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
+            }
+            .chartPlotStyle { plot in
+                plot
+                    .background(Color.primary.opacity(0.03))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .frame(height: 180)
+
+            Text(windowText)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 288, alignment: .topLeading)
+        .padding(16)
+        .background {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.primary.opacity(0.04))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(accentColor.opacity(0.14), lineWidth: 1)
+                }
+        }
+    }
+
+    private var accentColor: Color {
+        switch card.metric {
+        case .cpuUsage:
+            return .blue
+        case .cpuLoad:
+            return .indigo
+        case .memoryUsage:
+            return .indigo
+        case .batteryLevel:
+            return .green
+        case .systemPower:
+            return .orange
+        case .downloadRate:
+            return .cyan
+        case .uploadRate:
+            return .pink
+        }
+    }
+
+    private var deltaColor: Color {
+        if card.deltaText.hasPrefix("-") {
+            return .secondary
+        }
+        if card.deltaText == "0 B/s" || card.deltaText == "+0 pts" || card.deltaText == "+0.0 W" {
+            return .secondary
+        }
+        return accentColor
+    }
+
+    private var symbolName: String {
+        switch card.metric {
+        case .cpuUsage:
+            return "cpu.fill"
+        case .cpuLoad:
+            return "waveform.path.ecg"
+        case .memoryUsage:
+            return "memorychip.fill"
+        case .batteryLevel:
+            return "battery.100"
+        case .systemPower:
+            return "bolt.fill"
+        case .downloadRate:
+            return "arrow.down.circle.fill"
+        case .uploadRate:
+            return "arrow.up.circle.fill"
+        }
+    }
+
+    private var usesAreaFill: Bool {
+        switch card.metric {
+        case .cpuUsage, .memoryUsage, .batteryLevel:
+            return true
+        case .cpuLoad, .systemPower, .downloadRate, .uploadRate:
+            return false
+        }
+    }
+
+    private var windowText: String {
+        guard let first = card.points.first?.timestamp, let last = card.points.last?.timestamp else {
+            return "Waiting for recent saved samples."
+        }
+
+        return "\(first.formatted(.dateTime.hour().minute())) to \(last.formatted(.dateTime.hour().minute()))"
+    }
+
+    private func axisLabel(for value: Double) -> String {
+        switch card.metric {
+        case .cpuUsage, .memoryUsage, .batteryLevel:
+            return String(format: "%.0f%%", value)
+        case .cpuLoad:
+            return String(format: "%.1f", value)
+        case .systemPower:
+            return String(format: "%.0fW", value)
+        case .downloadRate, .uploadRate:
+            return compactRate(value)
+        }
+    }
+
+    private func compactRate(_ bytesPerSecond: Double) -> String {
+        guard bytesPerSecond > 0 else { return "0" }
+
+        let units = ["B", "K", "M", "G"]
+        var value = bytesPerSecond
+        var index = 0
+        while value >= 1024, index < units.count - 1 {
+            value /= 1024
+            index += 1
+        }
+        return String(format: "%.0f%@", value, units[index])
     }
 }
 
