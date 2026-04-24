@@ -5,6 +5,7 @@ enum DashboardSection: String, CaseIterable, Identifiable {
     case performance
     case power
     case network
+    case processes
     case history
     case trends
 
@@ -20,6 +21,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
             return "Power"
         case .network:
             return "Network"
+        case .processes:
+            return "Processes"
         case .history:
             return "History & Report"
         case .trends:
@@ -37,6 +40,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
             return "bolt.fill"
         case .network:
             return "network"
+        case .processes:
+            return "list.bullet.rectangle.portrait.fill"
         case .history:
             return "clock.arrow.trianglehead.counterclockwise.rotate.90"
         case .trends:
@@ -54,6 +59,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
             return ["battery", "charge", "watt", "usage", "power"]
         case .network:
             return ["wifi", "download", "upload", "ip", "throughput"]
+        case .processes:
+            return ["process", "pid", "memory", "cpu", "path", "terminate", "kill", "root", "system"]
         case .history:
             return ["history", "report", "timeline", "samples", "saved"]
         case .trends:
@@ -71,6 +78,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
             return "Battery state, system power, and charging behavior."
         case .network:
             return "Connection details and real-time throughput."
+        case .processes:
+            return "Live process table with resource use, executable paths, and local control actions."
         case .history:
             return "Saved monitoring data and the generated Markdown report."
         case .trends:
@@ -190,7 +199,9 @@ enum DashboardPresentationBuilder {
         downloadSpeedText: String,
         uploadSpeedText: String,
         sampleCount: Int,
-        coverageText: String
+        coverageText: String,
+        processCount: Int = 0,
+        processStatusText: String = "Live table"
     ) -> String {
         switch section {
         case .overview:
@@ -214,6 +225,8 @@ enum DashboardPresentationBuilder {
             return "\(powerUsageText) · \(compactPowerSource)"
         case .network:
             return "\(compactRate(downloadSpeedText))↓ · \(compactRate(uploadSpeedText))↑"
+        case .processes:
+            return processCount > 0 ? "\(processCount) processes · \(processStatusText)" : processStatusText
         case .history:
             let noun = sampleCount == 1 ? "sample" : "samples"
             return "\(sampleCount) \(noun) · \(coverageText)"

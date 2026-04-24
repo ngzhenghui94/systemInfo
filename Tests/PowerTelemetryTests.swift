@@ -14,6 +14,7 @@ struct PowerTelemetryTests {
         testSystemPowerPrefersScopedTelemetry()
         testChargeRateOnlyShowsWhenCharging()
         testBatteryHealthFallsBackToConditionWhenPresent()
+        testBatteryHealthIncludesSystemProfileCapacity()
         print("Power telemetry tests passed")
     }
 
@@ -29,7 +30,7 @@ struct PowerTelemetryTests {
 
         let registry: [String: Any] = [
             "BatteryData": [
-                "SystemPower": 10.2725
+                "SystemPower": 10_272.5
             ]
         ]
 
@@ -71,7 +72,7 @@ struct PowerTelemetryTests {
         expect(snapshot.systemPowerText == "—", "system power should stay unavailable without scoped telemetry")
         expect(snapshot.chargeRateText == "—", "charge rate should not show during discharge")
         expect(snapshot.powerMetricKind == nil, "unscoped samples should not be marked as system power")
-        expect(snapshot.batteryHealthText == "Good", "battery health should come from the public IOPS health key")
+        expect(snapshot.batteryHealthText == "Normal", "battery health should come from the public IOPS health key")
     }
 
     private static func testBatteryHealthFallsBackToConditionWhenPresent() {
@@ -92,5 +93,32 @@ struct PowerTelemetryTests {
             snapshot.batteryHealthText == "Check Battery",
             "battery health should prefer a more specific battery condition when one is present"
         )
+    }
+
+    private static func testBatteryHealthIncludesSystemProfileCapacity() {
+        let description: [String: Any] = [
+            kIOPSCurrentCapacityKey as String: 88.0,
+            kIOPSMaxCapacityKey as String: 100.0,
+            kIOPSPowerSourceStateKey as String: kIOPSBatteryPowerValue,
+            kIOPSBatteryHealthKey as String: kIOPSGoodValue
+        ]
+
+        let registry: [String: Any] = [
+            "CycleCount": 113
+        ]
+
+        let snapshot = PowerTelemetryParser.snapshot(
+            powerSourceDescription: description,
+            batteryRegistryProperties: registry,
+            systemProfileHealthInfo: SystemProfileBatteryHealthInfo(
+                conditionText: "Normal",
+                maximumCapacityText: "98%",
+                cycleCountText: "113"
+            )
+        )
+
+        expect(snapshot.batteryHealthText == "Normal · 98%", "battery health should include condition and maximum capacity")
+        expect(snapshot.batteryMaximumCapacityText == "98%", "maximum capacity should be exposed separately")
+        expect(snapshot.batteryCycleCountText == "113", "cycle count should be exposed separately")
     }
 }

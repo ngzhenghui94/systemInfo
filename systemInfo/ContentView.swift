@@ -38,6 +38,7 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var ipAddress: String = ""
     @Published var wifiNetwork: String = ""
     @Published var batteryHealth: String = ""
+    @Published var batteryMaximumCapacity: String = ""
     @Published var batteryTemperature: String = ""
     @Published var batteryCycleCount: String = ""
     @Published var freeMemory: String = ""
@@ -48,9 +49,13 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var latestReportText: String = "Power usage history will appear here once the app captures scoped system-power samples."
     @Published var historySamples: [SystemHistorySample] = []
     @Published var powerUsageReport: PowerUsageReportSnapshot = .empty
+    @Published var processRows: [ProcessMonitorRow] = []
+    @Published var processLastUpdated: String = "—"
+    @Published var processActionMessage: String = ""
 
     private let networkMonitor = NetworkMonitor()
     private let historyStore = SystemHistoryStore()
+    private let processMonitor = ProcessMonitorResolver()
     private var timer: Timer?
     private var lastPersistedAt: Date?
     private var latestDownloadBytesPerSecond: Double = 0
@@ -126,6 +131,7 @@ final class SystemInfoViewModel: ObservableObject {
             let cpuValue = Self.cpuUsageSummary()
             let loadValue = Self.loadAverageSummary()
             let thermal = Self.getThermalState()
+            let processSnapshot = self.processMonitor.snapshot(capturedAt: capturedAt)
 
             let speeds = self.networkMonitor.currentSpeeds()
             let dlBps = speeds.download
@@ -151,6 +157,8 @@ final class SystemInfoViewModel: ObservableObject {
                 self.cpuUsage = cpuValue
                 self.loadAverage = loadValue
                 self.thermalState = thermal
+                self.processRows = processSnapshot
+                self.processLastUpdated = Self.format(timestamp: capturedAt)
                 self.latestDownloadBytesPerSecond = dlBps
                 self.latestUploadBytesPerSecond = ulBps
                 self.downloadSpeed = Self.format(bytesPerSecond: dlBps)
@@ -161,6 +169,8 @@ final class SystemInfoViewModel: ObservableObject {
                     self.currentPowerSnapshot = snap
                     self.batteryLevel = snap.batteryLevelText
                     self.batteryHealth = snap.batteryHealthText
+                    self.batteryMaximumCapacity = snap.batteryMaximumCapacityText
+                    self.batteryCycleCount = snap.batteryCycleCountText
                     self.powerSource = snap.powerSource
                     self.powerUsage = snap.systemPowerText
                     self.chargingWattage = snap.chargeRateText
@@ -216,6 +226,8 @@ final class SystemInfoViewModel: ObservableObject {
         currentPowerSnapshot = snapshot
         batteryLevel = snapshot.batteryLevelText
         batteryHealth = snapshot.batteryHealthText
+        batteryMaximumCapacity = snapshot.batteryMaximumCapacityText
+        batteryCycleCount = snapshot.batteryCycleCountText
         powerSource = snapshot.powerSource
         powerUsage = snapshot.systemPowerText
         chargingWattage = snapshot.chargeRateText
@@ -562,6 +574,20 @@ final class SystemInfoViewModel: ObservableObject {
         lastReportGenerated = "—"
         powerUsageReport = .empty
         latestReportText = "History cleared. New samples will appear here once the app captures scoped system-power readings."
+    }
+
+    func terminateProcess(_ row: ProcessMonitorRow, signal: ProcessSignal) {
+        updateQueue.async { [weak self] in
+            let result = ProcessTerminator.terminate(processID: row.processID, signal: signal)
+            let refreshedRows = self?.processMonitor.snapshot(capturedAt: Date()) ?? []
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.processActionMessage = result.message
+                self.processRows = refreshedRows
+                self.processLastUpdated = Self.format(timestamp: Date())
+            }
+        }
     }
 
     private static func parsePercent(from text: String) -> Double? {
@@ -933,6 +959,10 @@ struct ContentView: View {
     @State private var selectedSection: DashboardSection? = .overview
     @State private var searchText: String = ""
     @State private var showResetConfirmation = false
+    @State private var processSearchText: String = ""
+    @State private var selectedProcessID: pid_t?
+    @State private var processSort = ProcessTableSort.defaultSort
+    @State private var pendingForceKillProcess: ProcessMonitorRow?
     @AppStorage("trendTimeWindow") private var selectedTrendWindow: TrendTimeWindow = .fiveMinutes
 
     private var cpuPercent: Double? {
@@ -1065,6 +1095,33 @@ struct ContentView: View {
         )
     }
 
+    private var displayedProcessRows: [ProcessMonitorRow] {
+        ProcessMonitorPresenter.displayRows(
+            viewModel.processRows,
+            query: processSearchText,
+            sort: processSort
+        )
+    }
+
+    private var selectedProcess: ProcessMonitorRow? {
+        guard let selectedProcessID else {
+            return displayedProcessRows.first
+        }
+
+        return viewModel.processRows.first { $0.processID == selectedProcessID }
+    }
+
+    private var isForceKillConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { pendingForceKillProcess != nil },
+            set: { isPresented in
+                if !isPresented {
+                    pendingForceKillProcess = nil
+                }
+            }
+        )
+    }
+
     var body: some View {
         NavigationSplitView {
             List(selection: $selectedSection) {
@@ -1159,6 +1216,21 @@ struct ContentView: View {
                 }
             }
         }
+        .alert(
+            "Force Kill Process?",
+            isPresented: isForceKillConfirmationPresented,
+            presenting: pendingForceKillProcess
+        ) { process in
+            Button("Force Kill", role: .destructive) {
+                viewModel.terminateProcess(process, signal: .forceKill)
+                pendingForceKillProcess = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingForceKillProcess = nil
+            }
+        } message: { process in
+            Text("\(process.name) (PID \(process.processID)) will receive SIGKILL.")
+        }
         .frame(minWidth: 1120, minHeight: 760)
         .onAppear {
             reconcileSelection()
@@ -1179,6 +1251,8 @@ struct ContentView: View {
             powerSection(availableWidth: availableWidth)
         case .network:
             networkSection(availableWidth: availableWidth)
+        case .processes:
+            processesSection(availableWidth: availableWidth)
         case .history:
             historySection(availableWidth: availableWidth)
         case .trends:
@@ -1353,10 +1427,12 @@ struct ContentView: View {
                 DashboardFactsCard(
                     title: "Power Snapshot",
                     subtitle: "Current battery state plus separate system-power and charging signals.",
-                    minHeight: 196
+                    minHeight: 260
                 ) {
                     StatRow(icon: "battery.100", label: "Battery Level", value: viewModel.batteryLevel, iconColor: batteryGradient.first ?? .green)
                     StatRow(icon: "heart.text.square", label: "Battery Health", value: viewModel.batteryHealth, iconColor: .mint)
+                    StatRow(icon: "gauge.with.dots.needle.bottom.50percent", label: "Max Capacity", value: viewModel.batteryMaximumCapacity, iconColor: .green)
+                    StatRow(icon: "repeat.circle", label: "Cycle Count", value: viewModel.batteryCycleCount, iconColor: .cyan)
                     StatRow(icon: "powerplug", label: "Power Source", value: viewModel.powerSource, iconColor: .yellow)
                     StatRow(icon: "bolt.badge.clock", label: "System Power", value: viewModel.powerUsage, iconColor: .pink)
                     StatRow(icon: "bolt.fill", label: "Battery Charge Rate", value: viewModel.chargingWattage, iconColor: .orange)
@@ -1409,6 +1485,77 @@ struct ContentView: View {
                         )
                     }
                     .frame(maxWidth: .infinity, minHeight: 176, alignment: .topLeading)
+                }
+            }
+        }
+    }
+
+    private func processesSection(availableWidth: CGFloat) -> some View {
+        let rows = displayedProcessRows
+        let detail = ProcessDetailCard(
+            process: selectedProcess,
+            actionMessage: viewModel.processActionMessage,
+            onTerminate: { process in
+                viewModel.terminateProcess(process, signal: .terminate)
+            },
+            onForceKill: { process in
+                pendingForceKillProcess = process
+            }
+        )
+
+        return VStack(alignment: .leading, spacing: 16) {
+            DashboardSectionHeader(
+                title: "Process monitor",
+                subtitle: "Live per-process CPU, memory, owner, state, executable path, and local process controls."
+            )
+
+            GlassCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    HStack(spacing: 12) {
+                        Label("\(viewModel.processRows.count) processes", systemImage: "list.bullet.rectangle.portrait")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.pink)
+
+                        Text("Updated \(viewModel.processLastUpdated)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Spacer(minLength: 12)
+
+                        TextField("Search name, PID, or path", text: $processSearchText)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: min(max(availableWidth * 0.32, 260), 420))
+                    }
+
+                    if rows.count != viewModel.processRows.count {
+                        Text("\(rows.count) matching processes")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if availableWidth < 1_050 {
+                VStack(alignment: .leading, spacing: 16) {
+                    ProcessMonitorTable(
+                        rows: rows,
+                        selectedProcessID: $selectedProcessID,
+                        sort: $processSort
+                    )
+                    detail
+                }
+            } else {
+                HStack(alignment: .top, spacing: 16) {
+                    ProcessMonitorTable(
+                        rows: rows,
+                        selectedProcessID: $selectedProcessID,
+                        sort: $processSort
+                    )
+                    .frame(maxWidth: .infinity)
+
+                    detail
+                        .frame(width: 340)
                 }
             }
         }
@@ -1716,7 +1863,9 @@ struct ContentView: View {
             downloadSpeedText: viewModel.downloadSpeed,
             uploadSpeedText: viewModel.uploadSpeed,
             sampleCount: viewModel.historySampleCount,
-            coverageText: viewModel.historyCoverage
+            coverageText: viewModel.historyCoverage,
+            processCount: viewModel.processRows.count,
+            processStatusText: viewModel.processLastUpdated
         )
     }
 
@@ -1743,6 +1892,8 @@ struct ContentView: View {
             return .orange
         case .network:
             return .cyan
+        case .processes:
+            return .pink
         case .history:
             return .green
         case .trends:
@@ -1853,6 +2004,266 @@ struct ContentView: View {
         }
 
         selectedSection = filteredSections.first
+    }
+}
+
+private struct ProcessMonitorTable: View {
+    let rows: [ProcessMonitorRow]
+    @Binding var selectedProcessID: pid_t?
+    @Binding var sort: ProcessTableSort
+
+    private let tableWidth: CGFloat = 980
+
+    var body: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 12) {
+                DashboardPanelHeader(
+                    title: "Process Table",
+                    subtitle: "Sorted by memory by default; live rows refresh with the dashboard."
+                )
+
+                ScrollView([.horizontal, .vertical]) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ProcessTableHeader(sort: $sort)
+                        Divider()
+                            .padding(.vertical, 4)
+
+                        if rows.isEmpty {
+                            ContentUnavailableView(
+                                "No Processes Found",
+                                systemImage: "magnifyingglass",
+                                description: Text("Try a broader process search.")
+                            )
+                            .frame(width: tableWidth, height: 360)
+                        } else {
+                            LazyVStack(alignment: .leading, spacing: 2) {
+                                ForEach(rows) { row in
+                                    Button {
+                                        selectedProcessID = row.processID
+                                    } label: {
+                                        ProcessTableRow(
+                                            row: row,
+                                            isSelected: selectedProcessID == row.processID
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                    .frame(minWidth: tableWidth, alignment: .topLeading)
+                }
+                .frame(maxWidth: .infinity, minHeight: 460, maxHeight: 520, alignment: .topLeading)
+            }
+        }
+    }
+}
+
+private struct ProcessTableHeader: View {
+    @Binding var sort: ProcessTableSort
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ProcessTableHeaderButton(title: "Name", key: .name, width: 180, sort: $sort)
+            ProcessTableHeaderButton(title: "PID", key: .processID, width: 72, alignment: .trailing, sort: $sort)
+            ProcessTableHeaderButton(title: "User", key: .user, width: 120, sort: $sort)
+            ProcessTableHeaderButton(title: "CPU", key: .cpu, width: 80, alignment: .trailing, sort: $sort)
+            ProcessTableHeaderButton(title: "Memory", key: .memory, width: 110, alignment: .trailing, sort: $sort)
+            ProcessTableHeaderText(title: "State", width: 100)
+            ProcessTableHeaderText(title: "Executable Path", width: 318)
+        }
+        .frame(height: 28)
+    }
+}
+
+private struct ProcessTableHeaderButton: View {
+    let title: String
+    let key: ProcessTableSortKey
+    let width: CGFloat
+    var alignment: Alignment = .leading
+    @Binding var sort: ProcessTableSort
+
+    var body: some View {
+        Button {
+            sort = sort.toggled(for: key)
+        } label: {
+            HStack(spacing: 4) {
+                Text(title)
+                    .lineLimit(1)
+                Image(systemName: sortIcon)
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(sort.key == key ? .pink : .secondary)
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: width, alignment: alignment)
+            .padding(.horizontal, 8)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var sortIcon: String {
+        guard sort.key == key else {
+            return "arrow.up.arrow.down"
+        }
+        return sort.direction == .ascending ? "chevron.up" : "chevron.down"
+    }
+}
+
+private struct ProcessTableHeaderText: View {
+    let title: String
+    let width: CGFloat
+
+    var body: some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: width, alignment: .leading)
+            .padding(.horizontal, 8)
+    }
+}
+
+private struct ProcessTableRow: View {
+    let row: ProcessMonitorRow
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ProcessTableCell(text: row.name, width: 180, weight: .semibold)
+            ProcessTableCell(text: "\(row.processID)", width: 72, alignment: .trailing, monospaced: true)
+            ProcessTableCell(text: row.userName, width: 120)
+            ProcessTableCell(text: row.cpuText, width: 80, alignment: .trailing, monospaced: true)
+            ProcessTableCell(text: row.memoryText, width: 110, alignment: .trailing, monospaced: true)
+            ProcessTableCell(text: row.state, width: 100)
+            ProcessTableCell(
+                text: ProcessMonitorPresenter.truncatedPath(row.executablePathText, maxLength: 58),
+                width: 318,
+                monospaced: true,
+                color: .secondary
+            )
+        }
+        .frame(height: 36)
+        .background {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isSelected ? Color.pink.opacity(0.16) : Color.primary.opacity(0.035))
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+private struct ProcessTableCell: View {
+    let text: String
+    let width: CGFloat
+    var alignment: Alignment = .leading
+    var weight: Font.Weight = .regular
+    var monospaced = false
+    var color: Color = .primary
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12, weight: weight, design: monospaced ? .monospaced : .default))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .frame(width: width, alignment: alignment)
+            .padding(.horizontal, 8)
+    }
+}
+
+private struct ProcessDetailCard: View {
+    let process: ProcessMonitorRow?
+    let actionMessage: String
+    let onTerminate: (ProcessMonitorRow) -> Void
+    let onForceKill: (ProcessMonitorRow) -> Void
+
+    var body: some View {
+        GlassCard {
+            if let process {
+                VStack(alignment: .leading, spacing: 14) {
+                    DashboardPanelHeader(
+                        title: "Process Detail",
+                        subtitle: "\(process.name) · PID \(process.processID)"
+                    )
+
+                    VStack(spacing: 10) {
+                        ProcessDetailFactRow(label: "User", value: process.userName)
+                        ProcessDetailFactRow(label: "CPU", value: process.cpuText)
+                        ProcessDetailFactRow(label: "Memory", value: process.memoryText)
+                        ProcessDetailFactRow(label: "State", value: process.state)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Executable Path")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+
+                        Text(process.executablePathText)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.primary)
+                            .textSelection(.enabled)
+                            .lineLimit(5)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .fill(Color.primary.opacity(0.045))
+                            }
+                    }
+
+                    HStack(spacing: 10) {
+                        Button {
+                            onTerminate(process)
+                        } label: {
+                            Label("Terminate", systemImage: "xmark.circle")
+                        }
+
+                        Button(role: .destructive) {
+                            onForceKill(process)
+                        } label: {
+                            Label("Force Kill", systemImage: "bolt.trianglebadge.exclamationmark")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+
+                    if !actionMessage.isEmpty {
+                        Text(actionMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 420, alignment: .topLeading)
+            } else {
+                ContentUnavailableView(
+                    "No Process Selected",
+                    systemImage: "list.bullet.rectangle.portrait",
+                    description: Text("Select a process row to inspect it.")
+                )
+                .frame(maxWidth: .infinity, minHeight: 420)
+            }
+        }
+    }
+}
+
+private struct ProcessDetailFactRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 70, alignment: .leading)
+
+            Text(value)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
     }
 }
 
