@@ -1171,18 +1171,6 @@ struct ContentView: View {
 
                         ScrollView {
                             VStack(alignment: .leading, spacing: 20) {
-                                DashboardHeroCard(
-                                    summary: healthSummary,
-                                    hostName: viewModel.hostName,
-                                    macOSVersion: viewModel.macOSVersion,
-                                    cpuModel: viewModel.cpuModel,
-                                    gpuName: viewModel.gpuName,
-                                    historySubtitle: historySubtitle,
-                                    lastSaved: viewModel.lastHistorySave,
-                                    accentColor: toneColor(for: healthSummary.tone),
-                                    showFactsPanel: activeSection == .overview
-                                )
-
                                 sectionContent(for: activeSection, availableWidth: contentWidth)
                             }
                             .padding(20)
@@ -1541,7 +1529,13 @@ struct ContentView: View {
                     ProcessMonitorTable(
                         rows: rows,
                         selectedProcessID: $selectedProcessID,
-                        sort: $processSort
+                        sort: $processSort,
+                        onTerminate: { process in
+                            viewModel.terminateProcess(process, signal: .terminate)
+                        },
+                        onForceKill: { process in
+                            pendingForceKillProcess = process
+                        }
                     )
                     detail
                 }
@@ -1550,7 +1544,13 @@ struct ContentView: View {
                     ProcessMonitorTable(
                         rows: rows,
                         selectedProcessID: $selectedProcessID,
-                        sort: $processSort
+                        sort: $processSort,
+                        onTerminate: { process in
+                            viewModel.terminateProcess(process, signal: .terminate)
+                        },
+                        onForceKill: { process in
+                            pendingForceKillProcess = process
+                        }
                     )
                     .frame(maxWidth: .infinity)
 
@@ -2007,24 +2007,75 @@ struct ContentView: View {
     }
 }
 
+private enum ProcessTableColumn: String, CaseIterable, Identifiable {
+    case name, pid, actions, user, cpu, memory, state, path
+
+    var id: String { rawValue }
+
+    var defaultWidth: CGFloat {
+        switch self {
+        case .name: return 180
+        case .pid: return 72
+        case .actions: return 116
+        case .user: return 88
+        case .cpu: return 80
+        case .memory: return 110
+        case .state: return 100
+        case .path: return 318
+        }
+    }
+
+    var minimumWidth: CGFloat {
+        switch self {
+        case .name: return 110
+        case .pid: return 56
+        case .actions: return 110
+        case .user: return 56
+        case .cpu: return 56
+        case .memory: return 72
+        case .state: return 64
+        case .path: return 140
+        }
+    }
+
+    var maximumWidth: CGFloat {
+        switch self {
+        case .actions: return 180
+        default: return 800
+        }
+    }
+
+    static var defaultWidths: [ProcessTableColumn: CGFloat] {
+        Dictionary(uniqueKeysWithValues: ProcessTableColumn.allCases.map { ($0, $0.defaultWidth) })
+    }
+}
+
 private struct ProcessMonitorTable: View {
     let rows: [ProcessMonitorRow]
     @Binding var selectedProcessID: pid_t?
     @Binding var sort: ProcessTableSort
+    let onTerminate: (ProcessMonitorRow) -> Void
+    let onForceKill: (ProcessMonitorRow) -> Void
 
-    private let tableWidth: CGFloat = 980
+    @State private var columnWidths: [ProcessTableColumn: CGFloat] = ProcessTableColumn.defaultWidths
+
+    private var tableWidth: CGFloat {
+        ProcessTableColumn.allCases.reduce(0) { partial, column in
+            partial + (columnWidths[column] ?? column.defaultWidth) + 16
+        }
+    }
 
     var body: some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 12) {
                 DashboardPanelHeader(
                     title: "Process Table",
-                    subtitle: "Sorted by memory by default; live rows refresh with the dashboard."
+                    subtitle: "Sorted by memory by default; drag the dividers between headers to resize columns."
                 )
 
                 ScrollView([.horizontal, .vertical]) {
                     VStack(alignment: .leading, spacing: 0) {
-                        ProcessTableHeader(sort: $sort)
+                        ProcessTableHeader(sort: $sort, columnWidths: $columnWidths)
                         Divider()
                             .padding(.vertical, 4)
 
@@ -2043,7 +2094,10 @@ private struct ProcessMonitorTable: View {
                                     } label: {
                                         ProcessTableRow(
                                             row: row,
-                                            isSelected: selectedProcessID == row.processID
+                                            isSelected: selectedProcessID == row.processID,
+                                            columnWidths: columnWidths,
+                                            onTerminate: { onTerminate(row) },
+                                            onForceKill: { onForceKill(row) }
                                         )
                                     }
                                     .buttonStyle(.plain)
@@ -2061,18 +2115,102 @@ private struct ProcessMonitorTable: View {
 
 private struct ProcessTableHeader: View {
     @Binding var sort: ProcessTableSort
+    @Binding var columnWidths: [ProcessTableColumn: CGFloat]
 
     var body: some View {
         HStack(spacing: 0) {
-            ProcessTableHeaderButton(title: "Name", key: .name, width: 180, sort: $sort)
-            ProcessTableHeaderButton(title: "PID", key: .processID, width: 72, alignment: .trailing, sort: $sort)
-            ProcessTableHeaderButton(title: "User", key: .user, width: 120, sort: $sort)
-            ProcessTableHeaderButton(title: "CPU", key: .cpu, width: 80, alignment: .trailing, sort: $sort)
-            ProcessTableHeaderButton(title: "Memory", key: .memory, width: 110, alignment: .trailing, sort: $sort)
-            ProcessTableHeaderText(title: "State", width: 100)
-            ProcessTableHeaderText(title: "Executable Path", width: 318)
+            ForEach(ProcessTableColumn.allCases) { column in
+                headerCell(for: column)
+                    .overlay(alignment: .trailing) {
+                        ColumnResizeHandle(
+                            width: binding(for: column),
+                            minimumWidth: column.minimumWidth,
+                            maximumWidth: column.maximumWidth
+                        )
+                    }
+            }
         }
         .frame(height: 28)
+    }
+
+    private func width(for column: ProcessTableColumn) -> CGFloat {
+        columnWidths[column] ?? column.defaultWidth
+    }
+
+    private func binding(for column: ProcessTableColumn) -> Binding<CGFloat> {
+        Binding(
+            get: { columnWidths[column] ?? column.defaultWidth },
+            set: { columnWidths[column] = $0 }
+        )
+    }
+
+    @ViewBuilder
+    private func headerCell(for column: ProcessTableColumn) -> some View {
+        let columnWidth = width(for: column)
+        switch column {
+        case .name:
+            ProcessTableHeaderButton(title: "Name", key: .name, width: columnWidth, sort: $sort)
+        case .pid:
+            ProcessTableHeaderButton(title: "PID", key: .processID, width: columnWidth, alignment: .trailing, sort: $sort)
+        case .actions:
+            ProcessTableHeaderText(title: "Actions", width: columnWidth, alignment: .center)
+        case .user:
+            ProcessTableHeaderButton(title: "User", key: .user, width: columnWidth, sort: $sort)
+        case .cpu:
+            ProcessTableHeaderButton(title: "CPU", key: .cpu, width: columnWidth, alignment: .trailing, sort: $sort)
+        case .memory:
+            ProcessTableHeaderButton(title: "Memory", key: .memory, width: columnWidth, alignment: .trailing, sort: $sort)
+        case .state:
+            ProcessTableHeaderText(title: "State", width: columnWidth)
+        case .path:
+            ProcessTableHeaderText(title: "Executable Path", width: columnWidth)
+        }
+    }
+}
+
+private struct ColumnResizeHandle: View {
+    @Binding var width: CGFloat
+    let minimumWidth: CGFloat
+    let maximumWidth: CGFloat
+
+    @State private var dragStartWidth: CGFloat?
+    @State private var isHovering = false
+
+    var body: some View {
+        Rectangle()
+            .fill(Color.clear)
+            .contentShape(Rectangle())
+            .frame(width: 8)
+            .overlay {
+                Rectangle()
+                    .fill(Color.primary.opacity(isActive ? 0.45 : 0.0))
+                    .frame(width: 2, height: 18)
+            }
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        if dragStartWidth == nil {
+                            dragStartWidth = width
+                        }
+                        let proposed = (dragStartWidth ?? width) + value.translation.width
+                        width = min(maximumWidth, max(minimumWidth, proposed))
+                    }
+                    .onEnded { _ in
+                        dragStartWidth = nil
+                    }
+            )
+    }
+
+    private var isActive: Bool {
+        isHovering || dragStartWidth != nil
     }
 }
 
@@ -2113,12 +2251,13 @@ private struct ProcessTableHeaderButton: View {
 private struct ProcessTableHeaderText: View {
     let title: String
     let width: CGFloat
+    var alignment: Alignment = .leading
 
     var body: some View {
         Text(title)
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
-            .frame(width: width, alignment: .leading)
+            .frame(width: width, alignment: alignment)
             .padding(.horizontal, 8)
     }
 }
@@ -2126,18 +2265,34 @@ private struct ProcessTableHeaderText: View {
 private struct ProcessTableRow: View {
     let row: ProcessMonitorRow
     let isSelected: Bool
+    let columnWidths: [ProcessTableColumn: CGFloat]
+    let onTerminate: () -> Void
+    let onForceKill: () -> Void
+
+    private func width(for column: ProcessTableColumn) -> CGFloat {
+        columnWidths[column] ?? column.defaultWidth
+    }
+
+    private var pathDisplayLength: Int {
+        max(20, Int(width(for: .path) / 5.5))
+    }
 
     var body: some View {
         HStack(spacing: 0) {
-            ProcessTableCell(text: row.name, width: 180, weight: .semibold)
-            ProcessTableCell(text: "\(row.processID)", width: 72, alignment: .trailing, monospaced: true)
-            ProcessTableCell(text: row.userName, width: 120)
-            ProcessTableCell(text: row.cpuText, width: 80, alignment: .trailing, monospaced: true)
-            ProcessTableCell(text: row.memoryText, width: 110, alignment: .trailing, monospaced: true)
-            ProcessTableCell(text: row.state, width: 100)
+            ProcessTableCell(text: row.name, width: width(for: .name), weight: .semibold)
+            ProcessTableCell(text: "\(row.processID)", width: width(for: .pid), alignment: .trailing, monospaced: true)
+            ProcessTableActionsCell(
+                width: width(for: .actions),
+                onTerminate: onTerminate,
+                onForceKill: onForceKill
+            )
+            ProcessTableCell(text: row.userName, width: width(for: .user))
+            ProcessTableCell(text: row.cpuText, width: width(for: .cpu), alignment: .trailing, monospaced: true)
+            ProcessTableCell(text: row.memoryText, width: width(for: .memory), alignment: .trailing, monospaced: true)
+            ProcessTableCell(text: row.state, width: width(for: .state))
             ProcessTableCell(
-                text: ProcessMonitorPresenter.truncatedPath(row.executablePathText, maxLength: 58),
-                width: 318,
+                text: ProcessMonitorPresenter.truncatedPath(row.executablePathText, maxLength: pathDisplayLength),
+                width: width(for: .path),
                 monospaced: true,
                 color: .secondary
             )
@@ -2148,6 +2303,36 @@ private struct ProcessTableRow: View {
                 .fill(isSelected ? Color.pink.opacity(0.16) : Color.primary.opacity(0.035))
         }
         .contentShape(Rectangle())
+    }
+}
+
+private struct ProcessTableActionsCell: View {
+    let width: CGFloat
+    let onTerminate: () -> Void
+    let onForceKill: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button(action: onTerminate) {
+                Image(systemName: "xmark.circle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 40, height: 22)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Terminate (SIGTERM)")
+
+            Button(role: .destructive, action: onForceKill) {
+                Image(systemName: "bolt.trianglebadge.exclamationmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 40, height: 22)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Force Kill (SIGKILL)")
+        }
+        .frame(width: width, alignment: .center)
+        .padding(.horizontal, 8)
     }
 }
 
@@ -2367,138 +2552,6 @@ private struct DashboardSidebarMetricRow: View {
                 .foregroundStyle(.primary)
         }
         .padding(.vertical, 2)
-    }
-}
-
-private struct DashboardHeroCard: View {
-    let summary: DashboardHealthSummary
-    let hostName: String
-    let macOSVersion: String
-    let cpuModel: String
-    let gpuName: String
-    let historySubtitle: String
-    let lastSaved: String
-    let accentColor: Color
-    let showFactsPanel: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: showFactsPanel ? 18 : 12) {
-            if showFactsPanel {
-                ViewThatFits(in: .horizontal) {
-                    HStack(alignment: .top, spacing: 18) {
-                        heading
-                        facts
-                    }
-
-                    VStack(alignment: .leading, spacing: 18) {
-                        heading
-                        facts
-                    }
-                }
-            } else {
-                heading
-            }
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 10) {
-                    ForEach(summary.highlights, id: \.self) { highlight in
-                        Text(highlight)
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .background {
-                                Capsule()
-                                    .fill(Color.white.opacity(0.22))
-                            }
-                    }
-                }
-            }
-        }
-        .padding(showFactsPanel ? 18 : 16)
-        .background {
-            RoundedRectangle(cornerRadius: showFactsPanel ? 24 : 20, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            accentColor.opacity(0.22),
-                            Color.teal.opacity(0.08),
-                            Color.orange.opacity(0.12)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: showFactsPanel ? 24 : 20, style: .continuous)
-                        .fill(.thinMaterial.opacity(0.55))
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: showFactsPanel ? 24 : 20, style: .continuous)
-                        .stroke(Color.white.opacity(0.18), lineWidth: 1)
-                }
-        }
-    }
-
-    private var heading: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("System Monitor")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-
-            Text(summary.title)
-                .font(.system(size: 24, weight: .bold, design: .rounded))
-
-            Text(summary.subtitle)
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var facts: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            DashboardHeroFactRow(label: "Host", value: hostName, accentColor: accentColor)
-            Divider().overlay(Color.white.opacity(0.08))
-            DashboardHeroFactRow(label: "macOS", value: macOSVersion, accentColor: .blue)
-            Divider().overlay(Color.white.opacity(0.08))
-            DashboardHeroFactRow(label: "CPU", value: cpuModel, accentColor: .indigo)
-            Divider().overlay(Color.white.opacity(0.08))
-            DashboardHeroFactRow(label: "GPU", value: gpuName, accentColor: .mint)
-            Divider().overlay(Color.white.opacity(0.08))
-            DashboardHeroFactRow(label: "History", value: historySubtitle, accentColor: .green)
-            Divider().overlay(Color.white.opacity(0.08))
-            DashboardHeroFactRow(label: "Last Save", value: lastSaved, accentColor: .orange)
-        }
-        .frame(maxWidth: 360, alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color.white.opacity(0.14))
-        }
-    }
-}
-
-private struct DashboardHeroFactRow: View {
-    let label: String
-    let value: String
-    let accentColor: Color
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Text(label)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(accentColor)
-                .frame(width: 68, alignment: .leading)
-                .lineLimit(1)
-
-            Text(value)
-                .font(.caption)
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.78)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
     }
 }
 
