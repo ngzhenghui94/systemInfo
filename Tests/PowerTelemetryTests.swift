@@ -15,6 +15,12 @@ struct PowerTelemetryTests {
         testChargeRateOnlyShowsWhenCharging()
         testBatteryHealthFallsBackToConditionWhenPresent()
         testBatteryHealthIncludesSystemProfileCapacity()
+        testBatteryTemperatureConvertsHundredthsOfDegreesCelsius()
+        testBatteryTemperatureRejectsImplausibleValues()
+        testBatteryTimeRemainingFormatsDischarging()
+        testBatteryTimeRemainingFormatsCharging()
+        testBatteryTimeRemainingShowsCalculatingForUnknownEstimate()
+        testBatteryTimeRemainingReportsFullyCharged()
         print("Power telemetry tests passed")
     }
 
@@ -120,5 +126,80 @@ struct PowerTelemetryTests {
         expect(snapshot.batteryHealthText == "Normal · 98%", "battery health should include condition and maximum capacity")
         expect(snapshot.batteryMaximumCapacityText == "98%", "maximum capacity should be exposed separately")
         expect(snapshot.batteryCycleCountText == "113", "cycle count should be exposed separately")
+    }
+
+    private static func testBatteryTemperatureConvertsHundredthsOfDegreesCelsius() {
+        // AppleSmartBattery reports Temperature as integer hundredths of °C —
+        // 3120 → 31.20 °C.
+        let registry: [String: Any] = ["Temperature": 3120]
+        let celsius = PowerTelemetryParser.batteryTemperatureCelsius(from: registry)
+        expect(celsius != nil, "temperature parser should accept the top-level Temperature key")
+        expect(abs((celsius ?? 0) - 31.2) < 0.001, "temperature should be raw value divided by 100")
+
+        let nestedRegistry: [String: Any] = ["BatteryData": ["Temperature": 2895]]
+        let nestedCelsius = PowerTelemetryParser.batteryTemperatureCelsius(from: nestedRegistry)
+        expect(nestedCelsius != nil, "temperature parser should fall back to BatteryData.Temperature")
+        expect(abs((nestedCelsius ?? 0) - 28.95) < 0.001, "nested temperature should also be divided by 100")
+    }
+
+    private static func testBatteryTemperatureRejectsImplausibleValues() {
+        // Zero is a common uninitialised reading; 200 °C (raw 20000) is out of
+        // physical operating range — both should be rejected as noise.
+        let zeroRegistry: [String: Any] = ["Temperature": 0]
+        expect(
+            PowerTelemetryParser.batteryTemperatureCelsius(from: zeroRegistry) == nil,
+            "uninitialised zero readings should not be reported"
+        )
+
+        let outOfRangeRegistry: [String: Any] = ["Temperature": 20_000]
+        expect(
+            PowerTelemetryParser.batteryTemperatureCelsius(from: outOfRangeRegistry) == nil,
+            "physically impossible readings should not be reported"
+        )
+    }
+
+    private static func testBatteryTimeRemainingFormatsDischarging() {
+        let description: [String: Any] = [
+            kIOPSIsChargingKey as String: false,
+            kIOPSIsChargedKey as String: false,
+            kIOPSTimeToEmptyKey as String: 135
+        ]
+
+        let text = PowerTelemetryParser.batteryTimeRemainingText(from: description)
+        expect(text == "2h 15m remaining", "discharging time should format as hours/minutes with 'remaining'")
+    }
+
+    private static func testBatteryTimeRemainingFormatsCharging() {
+        let description: [String: Any] = [
+            kIOPSIsChargingKey as String: true,
+            kIOPSIsChargedKey as String: false,
+            kIOPSTimeToFullChargeKey as String: 45
+        ]
+
+        let text = PowerTelemetryParser.batteryTimeRemainingText(from: description)
+        expect(text == "45m to full", "charging time under an hour should drop the hour component and end with 'to full'")
+    }
+
+    private static func testBatteryTimeRemainingShowsCalculatingForUnknownEstimate() {
+        // IOKit returns -1 while the kernel is still gathering enough samples
+        // to produce an estimate (typical right after waking from sleep).
+        let description: [String: Any] = [
+            kIOPSIsChargingKey as String: false,
+            kIOPSIsChargedKey as String: false,
+            kIOPSTimeToEmptyKey as String: -1
+        ]
+
+        let text = PowerTelemetryParser.batteryTimeRemainingText(from: description)
+        expect(text == "Calculating…", "negative IOPS estimates should surface as the calculating placeholder")
+    }
+
+    private static func testBatteryTimeRemainingReportsFullyCharged() {
+        let description: [String: Any] = [
+            kIOPSIsChargingKey as String: false,
+            kIOPSIsChargedKey as String: true
+        ]
+
+        let text = PowerTelemetryParser.batteryTimeRemainingText(from: description)
+        expect(text == "Fully charged", "charged batteries should short-circuit before reading the time keys")
     }
 }

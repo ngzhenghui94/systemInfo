@@ -13,6 +13,10 @@ struct NetworkDetailsTests {
         try testDirectSSIDWins()
         try testCachedScanRecordProvidesSSIDFallback()
         testPrimaryInterfaceNameReadsDynamicStoreState()
+        testRouterReadsFromGlobalIPv4State()
+        testRouterReturnsNilWhenMissingOrBlank()
+        testDNSServersJoinsAddressesWithCommas()
+        testDNSServersReturnsNilForEmptyOrMalformedState()
         print("Network details tests passed")
     }
 
@@ -46,6 +50,48 @@ struct NetworkDetailsTests {
         expect(
             NetworkDetailsResolver.primaryInterfaceName(fromGlobalIPv4State: state) == "en0",
             "primary interface should come from the global IPv4 state"
+        )
+    }
+
+    private static func testRouterReadsFromGlobalIPv4State() {
+        let state: [String: Any] = ["Router": "192.168.1.1"]
+        expect(
+            NetworkDetailsResolver.router(fromGlobalIPv4State: state) == "192.168.1.1",
+            "router should be pulled directly from the Router key"
+        )
+    }
+
+    private static func testRouterReturnsNilWhenMissingOrBlank() {
+        expect(
+            NetworkDetailsResolver.router(fromGlobalIPv4State: [:]) == nil,
+            "missing Router key should return nil so the UI shows '—'"
+        )
+        expect(
+            NetworkDetailsResolver.router(fromGlobalIPv4State: ["Router": "  "]) == nil,
+            "whitespace-only Router values should also be treated as absent"
+        )
+    }
+
+    private static func testDNSServersJoinsAddressesWithCommas() {
+        let state: [String: Any] = ["ServerAddresses": ["8.8.8.8", "1.1.1.1"]]
+        expect(
+            NetworkDetailsResolver.dnsServers(fromState: state) == "8.8.8.8, 1.1.1.1",
+            "multiple DNS servers should be joined with a comma+space separator"
+        )
+    }
+
+    private static func testDNSServersReturnsNilForEmptyOrMalformedState() {
+        expect(
+            NetworkDetailsResolver.dnsServers(fromState: [:]) == nil,
+            "missing ServerAddresses key should return nil"
+        )
+        expect(
+            NetworkDetailsResolver.dnsServers(fromState: ["ServerAddresses": [String]()]) == nil,
+            "empty ServerAddresses array should return nil"
+        )
+        expect(
+            NetworkDetailsResolver.dnsServers(fromState: ["ServerAddresses": ["", "  "]]) == nil,
+            "ServerAddresses entries that are all blank should return nil"
         )
     }
 }

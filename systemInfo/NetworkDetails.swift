@@ -34,6 +34,56 @@ enum NetworkDetailsResolver {
         return ipv4Address(on: uniqueCandidates) ?? "—"
     }
 
+    static func currentPrimaryInterface() -> String {
+        currentPrimaryInterfaceName() ?? "—"
+    }
+
+    static func currentDefaultGateway() -> String {
+        guard let store = SCDynamicStoreCreate(nil, "systemInfo" as CFString, nil, nil),
+              let globalState = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as NSString) as? [String: Any] else {
+            return "—"
+        }
+        return router(fromGlobalIPv4State: globalState) ?? "—"
+    }
+
+    static func currentMACAddress() -> String {
+        guard let interface = currentPrimaryInterfaceName(), !interface.isEmpty else {
+            return "—"
+        }
+        return macAddress(for: interface) ?? "—"
+    }
+
+    static func currentDNSServers() -> String {
+        guard let store = SCDynamicStoreCreate(nil, "systemInfo" as CFString, nil, nil) else {
+            return "—"
+        }
+
+        if let dnsState = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as NSString) as? [String: Any],
+           let formatted = dnsServers(fromState: dnsState) {
+            return formatted
+        }
+
+        return "—"
+    }
+
+    static func router(fromGlobalIPv4State state: [String: Any]) -> String? {
+        guard let router = state["Router"] as? String else { return nil }
+        let trimmed = router.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func dnsServers(fromState state: [String: Any]) -> String? {
+        guard let servers = state["ServerAddresses"] as? [String], !servers.isEmpty else {
+            return nil
+        }
+
+        let cleaned = servers
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        return cleaned.isEmpty ? nil : cleaned.joined(separator: ", ")
+    }
+
     static func primaryInterfaceName(fromGlobalIPv4State state: [String: Any]) -> String? {
         guard let interface = state["PrimaryInterface"] as? String else {
             return nil
@@ -98,6 +148,48 @@ enum NetworkDetailsResolver {
     private static func airPortState(for interface: String, store: SCDynamicStore) -> [String: Any]? {
         let key = "State:/Network/Interface/\(interface)/AirPort" as NSString
         return SCDynamicStoreCopyValue(store, key) as? [String: Any]
+    }
+
+    private static func macAddress(for interfaceName: String) -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
+            return nil
+        }
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let current = ptr {
+            defer { ptr = current.pointee.ifa_next }
+
+            let interface = current.pointee
+            guard interface.ifa_addr.pointee.sa_family == UInt8(AF_LINK) else { continue }
+
+            let name = String(cString: interface.ifa_name)
+            guard name == interfaceName else { continue }
+
+            if let formatted = formattedHardwareAddress(from: interface.ifa_addr) {
+                return formatted
+            }
+        }
+        return nil
+    }
+
+    private static func formattedHardwareAddress(from sockaddrPointer: UnsafeMutablePointer<sockaddr>) -> String? {
+        return sockaddrPointer.withMemoryRebound(to: sockaddr_dl.self, capacity: 1) { dlPointer -> String? in
+            var dl = dlPointer.pointee
+            let addressLength = Int(dl.sdl_alen)
+            let nameLength = Int(dl.sdl_nlen)
+
+            // Ethernet/Wi-Fi hardware addresses are six octets. Anything else
+            // (zero-length pseudo-interfaces, IPoIB, etc.) we skip.
+            guard addressLength == 6 else { return nil }
+
+            return withUnsafePointer(to: &dl.sdl_data) { dataPointer -> String in
+                let raw = UnsafeRawPointer(dataPointer).assumingMemoryBound(to: UInt8.self)
+                let bytes = (0..<addressLength).map { raw[nameLength + $0] }
+                return bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
+            }
+        }
     }
 
     private static func ipv4Address(on interfaces: [String]) -> String? {

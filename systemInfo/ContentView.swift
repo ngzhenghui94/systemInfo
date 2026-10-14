@@ -39,9 +39,16 @@ final class SystemInfoViewModel: ObservableObject {
     @Published var wifiNetwork: String = ""
     @Published var batteryHealth: String = ""
     @Published var batteryMaximumCapacity: String = ""
-    @Published var batteryTemperature: String = ""
+    @Published var batteryTemperature: String = "—"
     @Published var batteryCycleCount: String = ""
+    @Published var batteryTimeRemaining: String = "—"
     @Published var freeMemory: String = ""
+    @Published var swapUsage: String = "—"
+    @Published var architecture: String = "—"
+    @Published var primaryInterface: String = "—"
+    @Published var defaultGateway: String = "—"
+    @Published var macAddress: String = "—"
+    @Published var dnsServers: String = "—"
     @Published var historySampleCount: Int = 0
     @Published var historyCoverage: String = "0m"
     @Published var lastHistorySave: String = "—"
@@ -93,6 +100,7 @@ final class SystemInfoViewModel: ObservableObject {
         cpuModel = Self.getCPUModel()
         cpuCores = Self.getCPUCores()
         gpuName = Self.getGPUName()
+        architecture = Self.architectureSummary()
         cachedTotalDiskBytes = getTotalDiskSpaceBytes()
         totalDiskSpace = Self.format(bytes: cachedTotalDiskBytes)
         let freeBytes = getFreeDiskSpaceBytes()
@@ -128,6 +136,7 @@ final class SystemInfoViewModel: ObservableObject {
 
             let uptimeValue = Self.format(uptimeSeconds: ProcessInfo.processInfo.systemUptime)
             let (memUsage, freeMemValue) = Self.vmMemorySummaries()
+            let swapValue = Self.swapUsageSummary()
             let cpuValue = Self.cpuUsageSummary()
             let loadValue = Self.loadAverageSummary()
             let thermal = Self.getThermalState()
@@ -146,14 +155,20 @@ final class SystemInfoViewModel: ObservableObject {
                 : nil
 
             // SCDynamicStore WiFi + IP — every 15 s
-            let newIP: String? = tick % 15 == 1 ? NetworkDetailsResolver.currentIPv4Address() : nil
-            let newWifi: String? = tick % 15 == 1 ? NetworkDetailsResolver.currentWiFiSSID() : nil
+            let refreshNetworkDetails = tick % 15 == 1
+            let newIP: String? = refreshNetworkDetails ? NetworkDetailsResolver.currentIPv4Address() : nil
+            let newWifi: String? = refreshNetworkDetails ? NetworkDetailsResolver.currentWiFiSSID() : nil
+            let newPrimaryInterface: String? = refreshNetworkDetails ? NetworkDetailsResolver.currentPrimaryInterface() : nil
+            let newGateway: String? = refreshNetworkDetails ? NetworkDetailsResolver.currentDefaultGateway() : nil
+            let newMac: String? = refreshNetworkDetails ? NetworkDetailsResolver.currentMACAddress() : nil
+            let newDNS: String? = refreshNetworkDetails ? NetworkDetailsResolver.currentDNSServers() : nil
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.uptime = uptimeValue
                 self.memoryUsage = memUsage
                 self.freeMemory = freeMemValue
+                self.swapUsage = swapValue
                 self.cpuUsage = cpuValue
                 self.loadAverage = loadValue
                 self.thermalState = thermal
@@ -171,12 +186,18 @@ final class SystemInfoViewModel: ObservableObject {
                     self.batteryHealth = snap.batteryHealthText
                     self.batteryMaximumCapacity = snap.batteryMaximumCapacityText
                     self.batteryCycleCount = snap.batteryCycleCountText
+                    self.batteryTemperature = snap.batteryTemperatureText
+                    self.batteryTimeRemaining = snap.batteryTimeRemainingText
                     self.powerSource = snap.powerSource
                     self.powerUsage = snap.systemPowerText
                     self.chargingWattage = snap.chargeRateText
                 }
                 if let ip = newIP { self.ipAddress = ip }
                 if let wifi = newWifi { self.wifiNetwork = wifi }
+                if let iface = newPrimaryInterface { self.primaryInterface = iface }
+                if let gateway = newGateway { self.defaultGateway = gateway }
+                if let mac = newMac { self.macAddress = mac }
+                if let dns = newDNS { self.dnsServers = dns }
                 self.isRefreshing = false
                 self.persistHistoryIfNeeded(capturedAt: capturedAt, force: force)
             }
@@ -228,6 +249,8 @@ final class SystemInfoViewModel: ObservableObject {
         batteryHealth = snapshot.batteryHealthText
         batteryMaximumCapacity = snapshot.batteryMaximumCapacityText
         batteryCycleCount = snapshot.batteryCycleCountText
+        batteryTemperature = snapshot.batteryTemperatureText
+        batteryTimeRemaining = snapshot.batteryTimeRemainingText
         powerSource = snapshot.powerSource
         powerUsage = snapshot.systemPowerText
         chargingWattage = snapshot.chargeRateText
@@ -390,6 +413,41 @@ final class SystemInfoViewModel: ObservableObject {
         #endif
     }
     
+    /// Reads `vm.swapusage` (an `xsw_usage` struct) and formats it as
+    /// "<used> / <total> GB". Total of zero indicates the kernel has not
+    /// allocated swap yet — we still return "0 / 0 GB" so the row stays present.
+    private static func swapUsageSummary() -> String {
+        var swap = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        let result = sysctlbyname("vm.swapusage", &swap, &size, nil, 0)
+        guard result == 0 else { return "—" }
+
+        let usedGB = Double(swap.xsu_used) / 1_073_741_824
+        let totalGB = Double(swap.xsu_total) / 1_073_741_824
+        return String(format: "%.2f / %.2f GB", usedGB, totalGB)
+    }
+
+    /// Reports the host CPU architecture, flagging Rosetta translation when the
+    /// app itself is running under it. `hw.machine` is the canonical sysctl for
+    /// the machine ABI and `sysctl.proc_translated` is set when the current
+    /// process was launched through Rosetta.
+    private static func architectureSummary() -> String {
+        var size = 0
+        sysctlbyname("hw.machine", nil, &size, nil, 0)
+        var buffer = [CChar](repeating: 0, count: size)
+        sysctlbyname("hw.machine", &buffer, &size, nil, 0)
+        let machine = String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var translated: Int32 = 0
+        var translatedSize = MemoryLayout<Int32>.size
+        let translatedResult = sysctlbyname("sysctl.proc_translated", &translated, &translatedSize, nil, 0)
+        if translatedResult == 0, translated == 1 {
+            return machine.isEmpty ? "Rosetta" : "\(machine) (Rosetta)"
+        }
+
+        return machine.isEmpty ? "—" : machine
+    }
+
     private static func getThermalState() -> String {
         switch ProcessInfo.processInfo.thermalState {
         case .nominal:
@@ -1314,6 +1372,7 @@ struct ContentView: View {
                     StatRow(icon: "applelogo", label: "macOS", value: viewModel.macOSVersion, iconColor: .blue)
                     StatRow(icon: "cpu", label: "CPU", value: viewModel.cpuModel, iconColor: .indigo)
                     StatRow(icon: "square.stack.3d.up.fill", label: "GPU", value: viewModel.gpuName, iconColor: .mint)
+                    StatRow(icon: "cpu.fill", label: "Architecture", value: viewModel.architecture, iconColor: .purple)
                 }
 
                 DashboardFactsCard(
@@ -1360,6 +1419,7 @@ struct ContentView: View {
                 ) {
                     StatRow(icon: "memorychip.fill", label: "Used Memory", value: viewModel.memoryUsage, iconColor: .purple)
                     StatRow(icon: "memorychip", label: "Free Memory", value: viewModel.freeMemory, iconColor: .indigo)
+                    StatRow(icon: "arrow.left.arrow.right.square", label: "Swap", value: viewModel.swapUsage, iconColor: .pink)
                     StatRow(icon: "internaldrive", label: "Total Disk", value: viewModel.totalDiskSpace, iconColor: .orange)
                     StatRow(icon: "internaldrive.fill", label: "Free Disk", value: viewModel.freeDiskSpace, iconColor: .green)
                 }
@@ -1421,6 +1481,8 @@ struct ContentView: View {
                     StatRow(icon: "heart.text.square", label: "Battery Health", value: viewModel.batteryHealth, iconColor: .mint)
                     StatRow(icon: "gauge.with.dots.needle.bottom.50percent", label: "Max Capacity", value: viewModel.batteryMaximumCapacity, iconColor: .green)
                     StatRow(icon: "repeat.circle", label: "Cycle Count", value: viewModel.batteryCycleCount, iconColor: .cyan)
+                    StatRow(icon: "thermometer.medium", label: "Battery Temp", value: viewModel.batteryTemperature, iconColor: .red)
+                    StatRow(icon: "hourglass", label: "Time Remaining", value: viewModel.batteryTimeRemaining, iconColor: .indigo)
                     StatRow(icon: "powerplug", label: "Power Source", value: viewModel.powerSource, iconColor: .yellow)
                     StatRow(icon: "bolt.badge.clock", label: "System Power", value: viewModel.powerUsage, iconColor: .pink)
                     StatRow(icon: "bolt.fill", label: "Battery Charge Rate", value: viewModel.chargingWattage, iconColor: .orange)
@@ -1453,10 +1515,14 @@ struct ContentView: View {
                 DashboardFactsCard(
                     title: "Connection",
                     subtitle: "Current link identity.",
-                    minHeight: 176
+                    minHeight: 260
                 ) {
                     StatRow(icon: "wifi", label: "Wi-Fi", value: viewModel.wifiNetwork, iconColor: .blue)
                     StatRow(icon: "network", label: "IP Address", value: viewModel.ipAddress, iconColor: .purple)
+                    StatRow(icon: "point.3.connected.trianglepath.dotted", label: "Gateway", value: viewModel.defaultGateway, iconColor: .orange)
+                    StatRow(icon: "antenna.radiowaves.left.and.right", label: "Interface", value: viewModel.primaryInterface, iconColor: .cyan)
+                    StatRow(icon: "barcode", label: "MAC Address", value: viewModel.macAddress, iconColor: .indigo)
+                    StatRow(icon: "server.rack", label: "DNS", value: viewModel.dnsServers, iconColor: .green)
                     StatRow(icon: "desktopcomputer", label: "Host", value: viewModel.hostName, iconColor: .teal)
                 }
 
@@ -2016,7 +2082,7 @@ private enum ProcessTableColumn: String, CaseIterable, Identifiable {
         switch self {
         case .name: return 180
         case .pid: return 72
-        case .actions: return 116
+        case .actions: return 72
         case .user: return 88
         case .cpu: return 80
         case .memory: return 110
@@ -2029,7 +2095,7 @@ private enum ProcessTableColumn: String, CaseIterable, Identifiable {
         switch self {
         case .name: return 110
         case .pid: return 56
-        case .actions: return 110
+        case .actions: return 64
         case .user: return 56
         case .cpu: return 56
         case .memory: return 72
@@ -2040,7 +2106,7 @@ private enum ProcessTableColumn: String, CaseIterable, Identifiable {
 
     var maximumWidth: CGFloat {
         switch self {
-        case .actions: return 180
+        case .actions: return 140
         default: return 800
         }
     }
@@ -2312,23 +2378,23 @@ private struct ProcessTableActionsCell: View {
     let onForceKill: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 4) {
             Button(action: onTerminate) {
                 Image(systemName: "xmark.circle")
-                    .font(.system(size: 12, weight: .semibold))
-                    .frame(width: 40, height: 22)
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 22, height: 16)
             }
             .buttonStyle(.bordered)
-            .controlSize(.small)
+            .controlSize(.mini)
             .help("Terminate (SIGTERM)")
 
             Button(role: .destructive, action: onForceKill) {
                 Image(systemName: "bolt.trianglebadge.exclamationmark")
-                    .font(.system(size: 12, weight: .semibold))
-                    .frame(width: 40, height: 22)
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 22, height: 16)
             }
             .buttonStyle(.bordered)
-            .controlSize(.small)
+            .controlSize(.mini)
             .help("Force Kill (SIGKILL)")
         }
         .frame(width: width, alignment: .center)
@@ -2675,6 +2741,7 @@ private struct DashboardTrendCard: View {
                     .foregroundStyle(.secondary)
                 }
             }
+            .chartYScale(domain: yAxisDomain)
             .chartPlotStyle { plot in
                 plot
                     .background(Color.primary.opacity(0.03))
@@ -2773,6 +2840,18 @@ private struct DashboardTrendCard: View {
             return String(format: "%.0fW", value)
         case .downloadRate, .uploadRate:
             return compactRate(value)
+        }
+    }
+
+    private var yAxisDomain: ClosedRange<Double> {
+        switch card.metric {
+        case .cpuUsage, .memoryUsage, .batteryLevel:
+            return 0...100
+        case .cpuLoad, .systemPower, .downloadRate, .uploadRate:
+            let values = card.points.map(\.value)
+            let lower = min(0, values.min() ?? 0)
+            let upper = max(values.max() ?? 1, lower + 1)
+            return lower...upper
         }
     }
 

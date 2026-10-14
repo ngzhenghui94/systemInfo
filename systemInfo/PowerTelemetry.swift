@@ -11,6 +11,9 @@ struct PowerTelemetrySnapshot: Equatable {
     let batteryHealthText: String
     let batteryMaximumCapacityText: String
     let batteryCycleCountText: String
+    let batteryTemperatureText: String
+    let batteryTemperatureCelsius: Double?
+    let batteryTimeRemainingText: String
     let powerSource: String
     let systemPowerText: String
     let systemPowerWatts: Double?
@@ -24,6 +27,9 @@ struct PowerTelemetrySnapshot: Equatable {
         batteryHealthText: "—",
         batteryMaximumCapacityText: "—",
         batteryCycleCountText: "—",
+        batteryTemperatureText: "—",
+        batteryTemperatureCelsius: nil,
+        batteryTimeRemainingText: "—",
         powerSource: "No battery",
         systemPowerText: "—",
         systemPowerWatts: nil,
@@ -67,12 +73,17 @@ enum PowerTelemetryParser {
             batteryRegistryProperties: batteryRegistryProperties,
             systemProfileHealthInfo: systemProfileHealthInfo
         )
+        let batteryTemperatureCelsius = batteryTemperatureCelsius(from: batteryRegistryProperties)
+        let batteryTimeRemaining = batteryTimeRemainingText(from: powerSourceDescription)
 
         return PowerTelemetrySnapshot(
             batteryLevelText: batteryLevelText(from: powerSourceDescription),
             batteryHealthText: batteryHealth.summaryText,
             batteryMaximumCapacityText: batteryHealth.maximumCapacityText,
             batteryCycleCountText: batteryHealth.cycleCountText,
+            batteryTemperatureText: formattedCelsius(batteryTemperatureCelsius),
+            batteryTemperatureCelsius: batteryTemperatureCelsius,
+            batteryTimeRemainingText: batteryTimeRemaining,
             powerSource: powerSourceText(from: powerSourceDescription),
             systemPowerText: formattedWatts(powerResult?.watts),
             systemPowerWatts: powerResult?.watts,
@@ -214,6 +225,71 @@ enum PowerTelemetryParser {
             }
         }
         return nil
+    }
+
+    /// AppleSmartBattery reports temperature as integer hundredths of a degree
+    /// Celsius (e.g., 3120 → 31.20 °C). On Apple Silicon the same value sometimes
+    /// appears under `BatteryData.Temperature` or `VirtualTemperature`.
+    static func batteryTemperatureCelsius(from properties: [String: Any]?) -> Double? {
+        guard let properties else { return nil }
+
+        let candidatePaths: [[String]] = [
+            ["Temperature"],
+            ["BatteryData", "Temperature"],
+            ["VirtualTemperature"],
+            ["BatteryData", "VirtualTemperature"]
+        ]
+
+        for path in candidatePaths {
+            guard let raw = number(at: path, in: properties), raw > 0 else { continue }
+            let celsius = raw / 100.0
+            // Plausible operating range — anything outside this band is almost
+            // certainly an uninitialised or wraparound reading from IOKit.
+            if celsius > 0, celsius < 100 {
+                return celsius
+            }
+        }
+        return nil
+    }
+
+    /// Returns a formatted time-remaining string from the IOPS power-source
+    /// description. Uses `kIOPSTimeToFullChargeKey` while charging and
+    /// `kIOPSTimeToEmptyKey` while discharging. The IOKit convention is:
+    ///   * `-1` → estimate is not yet available ("Calculating…")
+    ///   *  `0` → unknown / unavailable for the current source
+    static func batteryTimeRemainingText(from description: [String: Any]) -> String {
+        let isCharging = description[kIOPSIsChargingKey as String] as? Bool ?? false
+        let isCharged  = description[kIOPSIsChargedKey as String] as? Bool ?? false
+
+        if isCharged {
+            return "Fully charged"
+        }
+
+        let key = isCharging ? kIOPSTimeToFullChargeKey : kIOPSTimeToEmptyKey
+        guard let raw = number(from: description[key as String]) else {
+            return "—"
+        }
+
+        let minutes = Int(raw)
+        if minutes < 0 {
+            return "Calculating…"
+        }
+        if minutes == 0 {
+            return "—"
+        }
+
+        let suffix = isCharging ? " to full" : " remaining"
+        let hours = minutes / 60
+        let mins  = minutes % 60
+        if hours > 0 {
+            return "\(hours)h \(mins)m\(suffix)"
+        }
+        return "\(mins)m\(suffix)"
+    }
+
+    private static func formattedCelsius(_ celsius: Double?) -> String {
+        guard let celsius else { return "—" }
+        return String(format: "%.1f°C", celsius)
     }
 
     private static func chargeRateWatts(from description: [String: Any]) -> Double? {
