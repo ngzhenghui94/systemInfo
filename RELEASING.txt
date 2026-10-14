@@ -41,3 +41,12 @@ without opening the app or changing system settings. The normal build compiles a
 runs these native safety checks before submitting the signed app to Apple.
 python3 -m unittest discover -s Tests -p test_release.py checks capability retention
 and rejection of missing widget sandbox or development-only signed entitlements.
+
+python3 -m unittest discover -s Tests -p 'test_release*.py' runs release-script
+regression checks without accessing signing keys.
+Release recovery status (2026-10-14):
+Recovery artifact: build/releases/1.5/systemInfo.app and systemInfo-1.5.zip.
+Apple accepted 0bf8a0fe-32fb-4731-ba93-79ea79840836; ticket is stapled and
+Gatekeeper accepted. EdDSA signature/appcast/publication are still blocked.
+The shared update signing root failed closed with OSStatus=-25293; this
+recorded failure is not permission to probe again, change ACLs or rotate keys.

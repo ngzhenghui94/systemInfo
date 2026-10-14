@@ -38,6 +38,8 @@ def run(label, *command):
         # Only local diagnostics are retained; signing/keychain output is never disclosed.
         if command[0] == "xcodebuild":
             log.write_text(result.stdout + result.stderr)
+        if command[0] == "/usr/bin/swift" and command[1] == ROOT / "signing.swift":
+            raise RuntimeError(result.stderr.strip() or f"{label} failed without prompts")
         raise RuntimeError(f"{label} failed (exit {result.returncode}); inspect local Xcode diagnostics if present")
     return result.stdout
 
