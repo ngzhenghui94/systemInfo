@@ -1,0 +1,31 @@
+systemInfo release workflow
+
+./build.sh is the normal distribution build. It increments the highest published/local
+numeric version and build, uses the existing Developer ID team F57QJC4XU3 and bundle
+identity danielninetyfour.systemInfo, preserves nested entitlements, submits to Apple using existing
+Keychain profile notary, staples, validates and assesses before publication.
+The pinned Sparkle 2.10.0 signing tools use the existing local.swissKnife Keychain
+account; no private keys are exported or Keychain permissions changed.
+
+Output: build/systemInfo.app and immutable build/releases/<version>/systemInfo.app.
+Each immutable directory includes release.json, notarization.json, notarization.zip,
+systemInfo-<version>.zip and a signed appcast.xml. Existing directories/assets are never
+overwritten. Apple submissions and GitHub drafts remain available if a stage fails.
+Do not blindly retry an interrupted notarization; inspect its recorded ID/history.
+
+Binary releases are published to ngzhenghui94/homebrew-tap (systeminfo-v<version>).
+The appcast and cask alone are committed through the app-local .release/update-tap
+clone, fetched/rebased on origin/main before normal push. Authored source is never
+copied into that public artifact repository. No installation occurs during building.
+Installed-app/UI smoke checks are separate. Minimum macOS remains 26.1.
+
+Check for Updates in the app menu is manual-only. Sparkle automatic downloading,
+background checking and system profiling are disabled even for persisted preferences.
+Signed appcasts and EdDSA archives are required before extraction; Developer ID and
+notarized bundle validation remains enabled. Installation waits for outstanding
+operations and blocks new privileged operations until relaunch/cancellation.
+
+./build.sh --selftest checks version ordering and rejects unsafe release names/builds.
+Tests/UpdatesTests.swift exercises manual checks, operation draining and cancellation
+without opening the app or changing system settings. The normal build compiles and
+runs these native safety checks before submitting the signed app to Apple.

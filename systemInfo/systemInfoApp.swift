@@ -12,7 +12,9 @@ struct systemInfoApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+				.onAppear { AppUpdates.shared.start() }
         }
         .defaultSize(width: 1240, height: 840)
+		.commands { UpdateCommands() }
     }
 }

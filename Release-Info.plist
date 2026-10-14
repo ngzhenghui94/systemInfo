@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>SUFeedURL</key><string>https://raw.githubusercontent.com/ngzhenghui94/homebrew-tap/main/appcasts/systeminfo.xml</string>
+<key>SUPublicEDKey</key><string>ogSJSN3POPY/0djBMOpOVyHZxcLbooaAfJYwnin6RCw=</string>
+<key>SURequireSignedAppcast</key><true/>
+<key>SUVerifyUpdateBeforeExtraction</key><true/>
+<key>SUEnableAutomaticChecks</key><false/>
+<key>SUAutomaticallyUpdate</key><false/>
+<key>SUEnableSystemProfiling</key><false/>
+</dict></plist>
