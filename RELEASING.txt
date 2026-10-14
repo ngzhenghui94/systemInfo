@@ -4,8 +4,18 @@ systemInfo release workflow
 numeric version and build, uses the existing Developer ID team F57QJC4XU3 and bundle
 identity danielninetyfour.systemInfo, preserves nested entitlements, submits to Apple using existing
 Keychain profile notary, staples, validates and assesses before publication.
-The pinned Sparkle 2.10.0 signing tools use the existing local.swissKnife Keychain
-account; no private keys are exported or Keychain permissions changed.
+The pinned Sparkle 2.10.0 signer is invoked only by signing.swift with a verified
+in-memory key via stdin. The helper disables Keychain UI before accessing the
+existing local.swissKnife account, fails closed if access is denied, and performs
+public-key-only signature verification. No keys are created, rotated, persisted,
+or passed in argv; Keychain ACLs and permissions are never changed. The normal
+build checks access before building, and never retries an inaccessible key.
+Distribution builds disable development-only base-entitlement injection. Explicit
+SystemInfo-Release.entitlements and Widget-Release.entitlements preserve the
+existing user-selected read-only capability and widget sandbox without get-task-allow.
+The release workflow checks both targets before notarization.
+The interrupted 1.4 (build 5) artifact lacked these capabilities and was never
+submitted or published; 1.3 was rejected by Apple and is retained as evidence.
 
 Output: build/systemInfo.app and immutable build/releases/<version>/systemInfo.app.
 Each immutable directory includes release.json, notarization.json, notarization.zip,
@@ -29,3 +39,5 @@ operations and blocks new privileged operations until relaunch/cancellation.
 Tests/UpdatesTests.swift exercises manual checks, operation draining and cancellation
 without opening the app or changing system settings. The normal build compiles and
 runs these native safety checks before submitting the signed app to Apple.
+python3 -m unittest discover -s Tests -p test_release.py checks capability retention
+and rejection of missing widget sandbox or development-only signed entitlements.

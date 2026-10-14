@@ -90,14 +90,18 @@ def info(app):
 
 
 def verify_entitlements(app):
-    widget = app / "Contents/PlugIns/SystemInfoWidgetExtension.appex"
-    actual = plistlib.loads(run("Read widget entitlements", "codesign", "-d", "--entitlements", ":-", widget).encode())
-    if actual.get("com.apple.security.app-sandbox") is not True:
-        raise RuntimeError("Widget sandbox entitlement lost")
+    for name, bundle in (("SystemInfo", app), ("Widget", app / "Contents/PlugIns/SystemInfoWidgetExtension.appex")):
+        expected = plistlib.loads((ROOT / f"{name}-Release.entitlements").read_bytes())
+        actual = plistlib.loads(run("Read declared release entitlements", "codesign", "-d", "--entitlements", ":-", bundle).encode())
+        if any(actual.get(key) != value for key, value in expected.items()):
+            raise RuntimeError(f"{name} capability entitlement lost")
+        if actual.get("com.apple.security.get-task-allow"):
+            raise RuntimeError(f"{name} has a development-only entitlement")
 
 
 def main():
     ROOT.joinpath(".release").mkdir(exist_ok=True)
+    run("Existing update key without prompts", "/usr/bin/swift", ROOT / "signing.swift", "check", ACCOUNT, PUBLIC_KEY)
     identity_text = run("Developer ID identity", "security", "find-identity", "-v", "-p", "codesigning")
     matches = re.findall(r'\b([0-9A-Fa-f]{40})\s+"Developer ID Application: [^"\n]+ \(' + TEAM + r'\)"', identity_text)
     if len(matches) != 1:
@@ -122,10 +126,8 @@ def main():
     if len(tools) != 1:
         raise RuntimeError("Expected one official Sparkle 2.10.0 signing tool")
     signer = tools[0]
-    if run("Existing public update key", signer.with_name("generate_keys"), "--account", ACCOUNT, "-p").strip() != PUBLIC_KEY:
-        raise RuntimeError("Existing Keychain update key does not match the pinned public key; do not create or rotate keys")
     if feed.exists():
-        run("Existing feed signature", signer, "--account", ACCOUNT, "--verify", feed)
+        run("Existing feed signature", "/usr/bin/swift", ROOT / "signing.swift", "verify", PUBLIC_KEY, feed)
         xml = ET.parse(feed)
         ns = {"s": "http://www.andymatuschak.org/xml-namespaces/sparkle"}
         versions += [v.text for v in xml.findall(".//s:shortVersionString", ns)]
@@ -196,10 +198,10 @@ def main():
     run("Gatekeeper", "spctl", "--assess", "--type", "execute", app)
     package = output / f"{APP}-{version}.zip"
     run("Signed update archive", "ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, package)
-    signature = run("EdDSA archive signature", signer, "--account", ACCOUNT, "-p", package).strip()
+    signature = run("EdDSA archive signature without prompts", "/usr/bin/swift", ROOT / "signing.swift", "sign", signer, ACCOUNT, PUBLIC_KEY, package).strip()
     if not re.fullmatch(r"[A-Za-z0-9+/]{86}==", signature):
         raise RuntimeError("Invalid archive signature")
-    run("Verify archive EdDSA", signer, "--account", ACCOUNT, "--verify", package, signature)
+    run("Verify archive EdDSA", "/usr/bin/swift", ROOT / "signing.swift", "verify", PUBLIC_KEY, package, signature)
     tag = f"{SLUG}-v{version}"
     url = f"https://github.com/{REPO}/releases/download/{tag}/{package.name}"
     appcast = output / "appcast.xml"
@@ -211,8 +213,8 @@ def main():
 <enclosure url="{url}" length="{package.stat().st_size}" type="application/octet-stream" sparkle:edSignature="{signature}"/></item>
 </channel></rss>
 ''')
-    run("Sign appcast", signer, "--account", ACCOUNT, appcast)
-    run("Verify signed appcast", signer, "--account", ACCOUNT, "--verify", appcast)
+    run("Sign appcast without prompts", "/usr/bin/swift", ROOT / "signing.swift", "sign", signer, ACCOUNT, PUBLIC_KEY, appcast)
+    run("Verify signed appcast", "/usr/bin/swift", ROOT / "signing.swift", "verify", PUBLIC_KEY, appcast)
     assets = [package, appcast]
     hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in assets}
     run("Create immutable draft", "gh", "release", "create", tag, "--repo", REPO, "--target", "main", "--draft", "--title", f"{APP} {version}", "--notes", "Developer ID signed, Apple notarized and stapled. Signed Sparkle archive and appcast. Authored app source is not included.", *assets)
