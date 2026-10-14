@@ -13,23 +13,25 @@ func publicKey(_ value: String) throws -> Curve25519.Signing.PublicKey {
     return try Curve25519.Signing.PublicKey(rawRepresentation: data)
 }
 
-func keyData(service: String, account: String, sparkle: Bool) throws -> Data {
-    // Both controls are required: legacy login Keychain and modern authentication UI.
-    let disabled = SecKeychainSetUserInteractionAllowed(false)
-    guard disabled == errSecSuccess else { try fail("Cannot disable Keychain interaction (OSStatus \(disabled))") }
+func keyData(service: String, account: String, sparkle: Bool, authorizedBatch: Bool = false) throws -> Data {
+    // Only the explicit, separately approved batch mode may permit one UI access.
+    let interaction = SecKeychainSetUserInteractionAllowed(authorizedBatch)
+    guard interaction == errSecSuccess else { try fail("Cannot set Keychain interaction policy (OSStatus \(interaction))") }
+    defer { if authorizedBatch { _ = SecKeychainSetUserInteractionAllowed(false) } }
     var query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
         kSecAttrAccount as String: account,
         kSecReturnData as String: true,
         kSecMatchLimit as String: kSecMatchLimitOne,
-        kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
+        kSecUseAuthenticationUI as String: authorizedBatch ? kSecUseAuthenticationUIAllow : kSecUseAuthenticationUIFail
     ]
     if sparkle { query[kSecAttrProtocol as String] = kSecAttrProtocolSSH }
     var item: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &item)
     guard status == errSecSuccess else {
-        try fail("Existing signing key unavailable without UI: service=\(service), account=\(account), OSStatus=\(status); no retry, key creation, or ACL change performed")
+        let mode = authorizedBatch ? "in authorized batch" : "without UI"
+        try fail("Existing signing key unavailable \(mode): service=\(service), account=\(account), OSStatus=\(status); no retry, key creation, or ACL change performed")
     }
     guard let encoded = item as? Data, let text = String(data: encoded, encoding: .utf8) else {
         try fail("Existing signing key has an invalid encoding or length")
@@ -128,13 +130,39 @@ func sign(signer: String, key: Data, publicValue: String, file: String) throws -
     return isFeed ? "" : signature
 }
 
-func selftest(signer: String, account: String?, publicValue: String?) throws {
-    let missingAccount = "noninteractive-selftest-" + UUID().uuidString
-    do {
-        _ = try keyData(service: "https://sparkle-project.org", account: missingAccount, sparkle: true)
-        try fail("Selftest unexpectedly found a missing key")
-    } catch let error as SigningFailure {
-        guard error.message.contains("OSStatus=-25300") else { throw error }
+struct BatchRequest: Codable { let id: Int; let file: String }
+
+func emitBatch(_ response: [String: Any]) throws {
+    var data = try JSONSerialization.data(withJSONObject: response, options: .sortedKeys)
+    data.append(10)
+    try FileHandle.standardOutput.write(contentsOf: data)
+}
+
+func batchRequests(signer: String, key: Data, publicValue: String,
+                   read: () -> String?, emit: ([String: Any]) throws -> Void) throws {
+    try checkKey(key, against: publicValue)
+    try emit(["ready": true, "publicKey": publicValue])
+    while let line = read() {
+        let request: BatchRequest
+        do { request = try JSONDecoder().decode(BatchRequest.self, from: Data(line.utf8)) }
+        catch { try fail("Invalid batch request; expected JSON id integer and absolute file path") }
+        guard request.id >= 0, request.file.hasPrefix("/") else {
+            try fail("Invalid batch request; expected nonnegative id and absolute file path")
+        }
+        let signature = try sign(signer: signer, key: key, publicValue: publicValue, file: request.file)
+        try emit(["id": request.id, "ok": true, "signature": signature])
+    }
+}
+
+func selftest(signer: String, account: String?, publicValue: String?, probeMissingKey: Bool = true) throws {
+    if probeMissingKey {
+        let missingAccount = "noninteractive-selftest-" + UUID().uuidString
+        do {
+            _ = try keyData(service: "https://sparkle-project.org", account: missingAccount, sparkle: true)
+            try fail("Selftest unexpectedly found a missing key")
+        } catch let error as SigningFailure {
+            guard error.message.contains("OSStatus=-25300") else { throw error }
+        }
     }
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("silent-signing-" + UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
@@ -179,6 +207,24 @@ func selftest(signer: String, account: String?, publicValue: String?) throws {
     }
     let signature = try sign(signer: signer, key: exportedKey, publicValue: value, file: payload.path)
     _ = try sign(signer: signer, key: ephemeral.rawRepresentation, publicValue: value, file: feed.path)
+    var requests = [String(decoding: try JSONEncoder().encode(BatchRequest(id: 1, file: payload.path)), as: UTF8.self),
+                    String(decoding: try JSONEncoder().encode(BatchRequest(id: 2, file: feed.path)), as: UTF8.self)].makeIterator()
+    var responses: [[String: Any]] = []
+    try batchRequests(signer: signer, key: ephemeral.rawRepresentation, publicValue: value,
+                      read: { requests.next() }, emit: { responses.append($0) })
+    guard responses.count == 3, responses[0]["ready"] as? Bool == true,
+          responses[1]["id"] as? Int == 1, responses[1]["signature"] as? String == signature,
+          responses[2]["id"] as? Int == 2, responses[2]["signature"] as? String == "" else {
+        try fail("Selftest batch responses were incorrect")
+    }
+    var invalidRequests = ["{\"id\":true,\"file\":\"/invalid\"}"].makeIterator()
+    do {
+        try batchRequests(signer: signer, key: ephemeral.rawRepresentation, publicValue: value,
+                          read: { invalidRequests.next() }, emit: { _ in })
+        try fail("Selftest accepted invalid batch request")
+    } catch let error as SigningFailure {
+        guard error.message.hasPrefix("Invalid batch request") else { throw error }
+    }
     try Data("tampered".utf8).write(to: payload)
     do {
         try verify(publicValue: value, file: payload.path, signature: signature)
@@ -186,7 +232,7 @@ func selftest(signer: String, account: String?, publicValue: String?) throws {
     } catch let error as SigningFailure {
         guard error.message == "Ed25519 signature verification failed" else { throw error }
     }
-    print("PASS: no-UI missing-key error; raw/exported CI key decoding; official stdin archive/feed signing; public-only verification; tamper rejection")
+    print("PASS: \(probeMissingKey ? "no-UI missing-key error; " : "")raw/exported CI key decoding; official stdin archive/feed signing; fixture batch/EOF and invalid request checks; public-only verification; tamper rejection")
     if let account, let publicValue {
         let key = try keyData(service: "https://sparkle-project.org", account: account, sparkle: true)
         try Data("existing root signing selftest".utf8).write(to: payload)
@@ -198,6 +244,14 @@ func selftest(signer: String, account: String?, publicValue: String?) throws {
 do {
     let args = Array(CommandLine.arguments.dropFirst())
     switch args.first {
+    case "batch" where args.count == 4:
+        guard args[2] == "local.swissKnife", args[3] == "ogSJSN3POPY/0djBMOpOVyHZxcLbooaAfJYwnin6RCw=" else {
+            try fail("Authorized batch is restricted to the approved local.swissKnife signing root")
+        }
+        guard FileManager.default.isExecutableFile(atPath: args[1]) else { try fail("Missing official Sparkle signing tool") }
+        var key = try keyData(service: "https://sparkle-project.org", account: args[2], sparkle: true, authorizedBatch: true)
+        defer { key.resetBytes(in: 0..<key.count) }
+        try batchRequests(signer: args[1], key: key, publicValue: args[3], read: { readLine() }, emit: emitBatch)
     case "check" where args.count == 3:
         try checkKey(keyData(service: "https://sparkle-project.org", account: args[1], sparkle: true), against: args[2])
         print("PASS: existing signing root matches pinned public key without UI")
@@ -222,15 +276,19 @@ do {
         try checkKey(key, against: args[3])
         let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: key)
         print(try privateKey.signature(for: FileHandle.standardInput.readDataToEndOfFile()).base64EncodedString())
+    case "fixture-selftest" where args.count == 2:
+        try selftest(signer: args[1], account: nil, publicValue: nil, probeMissingKey: false)
     case "selftest" where args.count == 2 || args.count == 4:
         try selftest(signer: args[1], account: args.count == 4 ? args[2] : nil, publicValue: args.count == 4 ? args[3] : nil)
     default:
-        try fail("Usage: signing.swift check ACCOUNT PUBLIC_KEY | sign SIGN_UPDATE ACCOUNT PUBLIC_KEY FILE | verify PUBLIC_KEY FILE [SIGNATURE] | check-service SERVICE ACCOUNT PUBLIC_KEY | sign-stdin SERVICE ACCOUNT PUBLIC_KEY | check-env ENV_NAME PUBLIC_KEY | sign-env SIGN_UPDATE ENV_NAME PUBLIC_KEY FILE | selftest SIGN_UPDATE [ACCOUNT PUBLIC_KEY]")
+        try fail("Usage: signing.swift batch SIGN_UPDATE local.swissKnife PUBLIC_KEY (explicit user approval required) | check ACCOUNT PUBLIC_KEY | sign SIGN_UPDATE ACCOUNT PUBLIC_KEY FILE | verify PUBLIC_KEY FILE [SIGNATURE] | check-service SERVICE ACCOUNT PUBLIC_KEY | sign-stdin SERVICE ACCOUNT PUBLIC_KEY | check-env ENV_NAME PUBLIC_KEY | sign-env SIGN_UPDATE ENV_NAME PUBLIC_KEY FILE | selftest SIGN_UPDATE [ACCOUNT PUBLIC_KEY] | fixture-selftest SIGN_UPDATE")
     }
 } catch let error as SigningFailure {
+    if CommandLine.arguments.dropFirst().first == "batch" { try? emitBatch(["ok": false, "error": error.message]) }
     fputs("BLOCKED: \(error.message)\n", stderr)
     exit(1)
 } catch {
+    if CommandLine.arguments.dropFirst().first == "batch" { try? emitBatch(["ok": false, "error": "Signing helper platform or file operation failed; details withheld"]) }
     // Errors from platform libraries may contain input data; only the safe category is displayed.
     fputs("BLOCKED: signing helper platform or file operation failed; details withheld\n", stderr)
     exit(1)
