@@ -50,3 +50,15 @@ Apple accepted 0bf8a0fe-32fb-4731-ba93-79ea79840836; ticket is stapled and
 Gatekeeper accepted. EdDSA signature/appcast/publication are still blocked.
 The shared update signing root failed closed with OSStatus=-25293; this
 recorded failure is not permission to probe again, change ACLs or rotate keys.
+
+Recovery does not rebuild or re-read signing keys:
+  ./build.sh --prepare-feed VERSION PUBLIC_ARCHIVE_SIGNATURE
+validates the existing signed, stapled, accepted artifact and verifies the archive
+signature against the pinned public key, then writes an unsigned appcast exactly
+once. The authorized parent batch signer signs that appcast in place.
+  ./build.sh --publish VERSION
+public-verifies both signatures and exact feed version/build/URL/archive length,
+then runs the same immutable publication, checksum checks, tap push and app
+promotion as the normal build. Existing appcast files are never overwritten by
+prepare-feed; failed drafts/unfinished tap changes must be inspected, not retried.
+Neither recovery command accesses a private key or bypasses signature checks.

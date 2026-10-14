@@ -101,14 +101,7 @@ def verify_entitlements(app):
             raise RuntimeError(f"{name} has a development-only entitlement")
 
 
-def main():
-    ROOT.joinpath(".release").mkdir(exist_ok=True)
-    run("Existing update key without prompts", "/usr/bin/swift", ROOT / "signing.swift", "check", ACCOUNT, PUBLIC_KEY)
-    identity_text = run("Developer ID identity", "security", "find-identity", "-v", "-p", "codesigning")
-    matches = re.findall(r'\b([0-9A-Fa-f]{40})\s+"Developer ID Application: [^"\n]+ \(' + TEAM + r'\)"', identity_text)
-    if len(matches) != 1:
-        raise RuntimeError("Exactly one Developer ID Application certificate for F57QJC4XU3 is required")
-    identity = matches[0]
+def prepare_checkout():
     access = json.loads(run("Release destination", "gh", "api", f"repos/{REPO}"))
     if access.get("private") or access.get("default_branch") != "main" or not access.get("permissions", {}).get("push"):
         raise RuntimeError("Expected push access to the existing public artifact repository main")
@@ -120,6 +113,17 @@ def main():
         raise RuntimeError("Preserve and resolve unfinished release slice before another build")
     git("fetch", "origin", "main")
     git("merge", "--ff-only", "origin/main")
+
+
+def main():
+    ROOT.joinpath(".release").mkdir(exist_ok=True)
+    run("Existing update key without prompts", "/usr/bin/swift", ROOT / "signing.swift", "check", ACCOUNT, PUBLIC_KEY)
+    identity_text = run("Developer ID identity", "security", "find-identity", "-v", "-p", "codesigning")
+    matches = re.findall(r'\b([0-9A-Fa-f]{40})\s+"Developer ID Application: [^"\n]+ \(' + TEAM + r'\)"', identity_text)
+    if len(matches) != 1:
+        raise RuntimeError("Exactly one Developer ID Application certificate for F57QJC4XU3 is required")
+    identity = matches[0]
+    prepare_checkout()
     feed = CHECKOUT / f"appcasts/{SLUG}.xml"
     versions, builds = ["1.0"], ["1"]
     # Resolve the pinned official tools from this project's own Xcode package artifacts.
@@ -201,6 +205,32 @@ def main():
     package = output / f"{APP}-{version}.zip"
     run("Signed update archive", "ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", app, package)
     signature = run("EdDSA archive signature without prompts", "/usr/bin/swift", ROOT / "signing.swift", "sign", signer, ACCOUNT, PUBLIC_KEY, package).strip()
+    appcast = prepare_feed(version, signature)
+    run("Sign appcast without prompts", "/usr/bin/swift", ROOT / "signing.swift", "sign", signer, ACCOUNT, PUBLIC_KEY, appcast)
+    publish_staged(version)
+
+
+def prepare_feed(version, signature):
+    version_parts(version)
+    output = ROOT / "build/releases" / version
+    app = output / f"{APP}.app"
+    package = output / f"{APP}-{version}.zip"
+    metadata = info(app)
+    build = metadata["CFBundleVersion"]
+    if metadata["CFBundleShortVersionString"] != version:
+        raise RuntimeError("Artifact version does not match requested release")
+    notarization = json.loads((output / "notarization.json").read_text())
+    if notarization.get("version") != version or notarization.get("status") != "Accepted":
+        raise RuntimeError("Existing artifact has no accepted notarization")
+    run("Verify staged code", "codesign", "--verify", "--deep", "--strict", "-R", REQUIREMENT, app)
+    verify_entitlements(app)
+    run("Validate staged ticket", "xcrun", "stapler", "validate", app)
+    run("Assess staged app", "spctl", "--assess", "--type", "execute", app)
+    tag = f"{SLUG}-v{version}"
+    url = f"https://github.com/{REPO}/releases/download/{tag}/{package.name}"
+    appcast = output / "appcast.xml"
+    if appcast.exists():
+        raise RuntimeError("Preserve existing appcast; never overwrite a signed feed")
     if not re.fullmatch(r"[A-Za-z0-9+/]{86}==", signature):
         raise RuntimeError("Invalid archive signature")
     run("Verify archive EdDSA", "/usr/bin/swift", ROOT / "signing.swift", "verify", PUBLIC_KEY, package, signature)
@@ -215,8 +245,41 @@ def main():
 <enclosure url="{url}" length="{package.stat().st_size}" type="application/octet-stream" sparkle:edSignature="{signature}"/></item>
 </channel></rss>
 ''')
-    run("Sign appcast without prompts", "/usr/bin/swift", ROOT / "signing.swift", "sign", signer, ACCOUNT, PUBLIC_KEY, appcast)
+    return appcast
+
+
+def publish_staged(version):
+    version_parts(version)
+    output = ROOT / "build/releases" / version
+    app = output / f"{APP}.app"
+    package = output / f"{APP}-{version}.zip"
+    metadata = info(app)
+    build = metadata["CFBundleVersion"]
+    if metadata["CFBundleShortVersionString"] != version:
+        raise RuntimeError("Artifact version does not match requested release")
+    notarization = json.loads((output / "notarization.json").read_text())
+    if notarization.get("version") != version or notarization.get("status") != "Accepted":
+        raise RuntimeError("Existing artifact has no accepted notarization")
+    run("Verify staged code", "codesign", "--verify", "--deep", "--strict", "-R", REQUIREMENT, app)
+    verify_entitlements(app)
+    run("Validate staged ticket", "xcrun", "stapler", "validate", app)
+    run("Assess staged app", "spctl", "--assess", "--type", "execute", app)
+    tag = f"{SLUG}-v{version}"
+    url = f"https://github.com/{REPO}/releases/download/{tag}/{package.name}"
+    appcast = output / "appcast.xml"
+    feed = CHECKOUT / f"appcasts/{SLUG}.xml"
     run("Verify signed appcast", "/usr/bin/swift", ROOT / "signing.swift", "verify", PUBLIC_KEY, appcast)
+    xml = ET.parse(appcast)
+    ns = {"s": "http://www.andymatuschak.org/xml-namespaces/sparkle"}
+    item = xml.find("./channel/item")
+    enclosure = item.find("enclosure") if item is not None else None
+    if (item is None or enclosure is None or len(xml.findall("./channel/item")) != 1 or
+        item.findtext("s:version", namespaces=ns) != build or
+        item.findtext("s:shortVersionString", namespaces=ns) != version or
+        enclosure.get("url") != url or enclosure.get("length") != str(package.stat().st_size)):
+        raise RuntimeError("Signed feed does not describe the exact staged archive")
+    run("Verify staged archive EdDSA", "/usr/bin/swift", ROOT / "signing.swift", "verify", PUBLIC_KEY, package, enclosure.get("{http://www.andymatuschak.org/xml-namespaces/sparkle}edSignature", ""))
+    prepare_checkout()
     assets = [package, appcast]
     hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in assets}
     run("Create immutable draft", "gh", "release", "create", tag, "--repo", REPO, "--target", "main", "--draft", "--title", f"{APP} {version}", "--notes", "Developer ID signed, Apple notarized and stapled. Signed Sparkle archive and appcast. Authored app source is not included.", *assets)
@@ -260,6 +323,7 @@ end
     run("Promote published app", "ditto", app, final)
     print(f"PASS: signed, notarized, stapled, assessed; published https://github.com/{REPO}/releases/tag/{tag}", flush=True)
     print(f"Ready: {final}\nImmutable app: {app}\nArchive: {package}", flush=True)
+    (output / "release.json").write_text(json.dumps({"version": version, "build": build, "status": "Published", "notarization_id": notarization["id"], "published": True}, indent=2) + "\n")
 
 
 if __name__ == "__main__":
@@ -269,7 +333,11 @@ if __name__ == "__main__":
         elif not sys.argv[1:]:
             selftest()
             main()
+        elif len(sys.argv) == 4 and sys.argv[1] == "--prepare-feed":
+            print(prepare_feed(sys.argv[2], sys.argv[3]))
+        elif len(sys.argv) == 3 and sys.argv[1] == "--publish":
+            publish_staged(sys.argv[2])
         else:
-            raise ValueError("Usage: ./build.sh [--selftest]")
+            raise ValueError("Usage: ./build.sh [--selftest | --prepare-feed VERSION PUBLIC_SIGNATURE | --publish VERSION]")
     except (OSError, RuntimeError, ValueError, KeyError, ET.ParseError) as error:
         sys.exit(f"BLOCKED: {error}. Preserve build/releases and .release/update-tap; inspect recorded submissions/drafts before retrying.")

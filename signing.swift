@@ -45,11 +45,23 @@ func decodeKey(_ text: String, sparkle: Bool) throws -> Data {
     return decoded
 }
 
+func decodeEnvironmentKey(_ value: String) throws -> Data {
+    guard let decoded = Data(base64Encoded: value.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+        try fail("Existing signing key has an invalid encoding or length")
+    }
+    if decoded.count == 32 || decoded.count == 96 { return decoded }
+    // Historical CI encodes the exported base64 key file, not the raw key bytes.
+    guard let exported = String(data: decoded, encoding: .utf8) else {
+        try fail("Existing signing key has an invalid encoding or length")
+    }
+    return try decodeKey(exported, sparkle: true)
+}
+
 func environmentKey(_ name: String) throws -> Data {
     guard let value = ProcessInfo.processInfo.environment[name], !value.isEmpty else {
         try fail("Original signing key environment variable is unavailable")
     }
-    return try decodeKey(value, sparkle: true)
+    return try decodeEnvironmentKey(value)
 }
 
 func checkKey(_ key: Data, against publicValue: String) throws {
@@ -136,6 +148,23 @@ func selftest(signer: String, account: String?, publicValue: String?) throws {
     let value = ephemeral.publicKey.rawRepresentation.base64EncodedString()
     let decoded = try decodeKey(ephemeral.rawRepresentation.base64EncodedString(), sparkle: true)
     try checkKey(decoded, against: value)
+    let exported = Data((ephemeral.rawRepresentation.base64EncodedString() + "\n").utf8).base64EncodedString()
+    let exportedKey = try decodeEnvironmentKey(exported)
+    guard exportedKey == decoded, try decodeEnvironmentKey(ephemeral.rawRepresentation.base64EncodedString()) == decoded else {
+        try fail("Selftest decoded CI export incorrectly")
+    }
+    var legacy = Data(repeating: 0, count: 64)
+    legacy.append(ephemeral.publicKey.rawRepresentation)
+    guard try decodeEnvironmentKey(legacy.base64EncodedString()) == legacy,
+          try decodeEnvironmentKey(Data((legacy.base64EncodedString() + "\n").utf8).base64EncodedString()) == legacy else {
+        try fail("Selftest decoded legacy CI export incorrectly")
+    }
+    do {
+        _ = try decodeEnvironmentKey(Data(exported.utf8).base64EncodedString())
+        try fail("Selftest accepted multiply wrapped export")
+    } catch let error as SigningFailure {
+        guard error.message == "Existing signing key has an invalid encoding or length" else { throw error }
+    }
     do {
         _ = try decodeKey("invalid", sparkle: true)
         try fail("Selftest accepted malformed key")
@@ -148,7 +177,7 @@ func selftest(signer: String, account: String?, publicValue: String?) throws {
     } catch let error as SigningFailure {
         guard error.message.contains("does not match pinned public key") else { throw error }
     }
-    let signature = try sign(signer: signer, key: ephemeral.rawRepresentation, publicValue: value, file: payload.path)
+    let signature = try sign(signer: signer, key: exportedKey, publicValue: value, file: payload.path)
     _ = try sign(signer: signer, key: ephemeral.rawRepresentation, publicValue: value, file: feed.path)
     try Data("tampered".utf8).write(to: payload)
     do {
@@ -157,7 +186,7 @@ func selftest(signer: String, account: String?, publicValue: String?) throws {
     } catch let error as SigningFailure {
         guard error.message == "Ed25519 signature verification failed" else { throw error }
     }
-    print("PASS: no-UI missing-key error; official stdin archive/feed signing; public-only verification; tamper rejection")
+    print("PASS: no-UI missing-key error; raw/exported CI key decoding; official stdin archive/feed signing; public-only verification; tamper rejection")
     if let account, let publicValue {
         let key = try keyData(service: "https://sparkle-project.org", account: account, sparkle: true)
         try Data("existing root signing selftest".utf8).write(to: payload)
