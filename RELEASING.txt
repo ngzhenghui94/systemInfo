@@ -47,9 +47,11 @@ regression checks without accessing signing keys.
 Release recovery status (2026-10-14):
 Recovery artifact: build/releases/1.5/systemInfo.app and systemInfo-1.5.zip.
 Apple accepted 0bf8a0fe-32fb-4731-ba93-79ea79840836; ticket is stapled and
-Gatekeeper accepted. EdDSA signature/appcast/publication are still blocked.
-The shared update signing root failed closed with OSStatus=-25293; this
-recorded failure is not permission to probe again, change ACLs or rotate keys.
+Gatekeeper accepted. The parent-authorized batch signer supplied verified archive
+and appcast signatures; systeminfo-v1.5 is published with its cask and signed feed.
+The parent installed this artifact and the manual update check reported up-to-date.
+The earlier denied-key observation remains historical evidence; it never authorizes
+unapproved Keychain prompts, ACL changes or key rotation.
 
 Recovery does not rebuild or re-read signing keys:
   ./build.sh --prepare-feed VERSION PUBLIC_ARCHIVE_SIGNATURE
