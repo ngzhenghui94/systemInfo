@@ -144,7 +144,7 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     (output / "release.json").write_text(json.dumps({"version": version, "build": build, "status": "Building"}, indent=2) + "\n")
     print(f"Building {APP} {version} ({build}); preserving previous releases", flush=True)
-    run("Signed Xcode Release build", "xcodebuild", "-quiet", "-project", f"{APP}.xcodeproj", "-scheme", APP, "-configuration", "Release", "-sdk", "macosx", "-destination", "generic/platform=macOS", "-derivedDataPath", DERIVED, "-clonedSourcePackagesDirPath", ROOT / ".release/SourcePackages", f"MARKETING_VERSION={version}", f"CURRENT_PROJECT_VERSION={build}", "CODE_SIGN_STYLE=Manual", f"CODE_SIGN_IDENTITY={identity}", f"DEVELOPMENT_TEAM={TEAM}", "ENABLE_HARDENED_RUNTIME=YES", "OTHER_CODE_SIGN_FLAGS=--timestamp", "build")
+    run("Signed Xcode Release build", "xcodebuild", "-quiet", "-project", f"{APP}.xcodeproj", "-scheme", APP, "-configuration", "Release", "-sdk", "macosx", "-destination", "generic/platform=macOS", "-derivedDataPath", DERIVED, "-clonedSourcePackagesDirPath", ROOT / ".release/SourcePackages", f"MARKETING_VERSION={version}", f"CURRENT_PROJECT_VERSION={build}", "CODE_SIGN_STYLE=Manual", f"CODE_SIGN_IDENTITY={identity}", f"DEVELOPMENT_TEAM={TEAM}", "ENABLE_HARDENED_RUNTIME=YES", "CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO", "OTHER_CODE_SIGN_FLAGS=--timestamp", "build")
     source = DERIVED / f"Build/Products/Release/{APP}.app"
     if info(source).get("CFBundleVersion") != build:
         raise RuntimeError("Xcode did not apply release numbering")
