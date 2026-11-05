@@ -3,6 +3,7 @@
 import datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import re
@@ -66,9 +67,32 @@ def next_version(versions, builds):
     return ".".join(version), str(build)
 
 
+def select_identity(identity_text, requested=None):
+    matches = [match.upper() for match in re.findall(r'\b([0-9A-Fa-f]{40})\s+"Developer ID Application: [^"\n]+ \(' + TEAM + r'\)"', identity_text)]
+    if requested is not None:
+        requested = requested.upper()
+        if not re.fullmatch(r"[0-9A-F]{40}", requested) or requested not in matches:
+            raise RuntimeError("Requested Developer ID fingerprint is not a valid identity for this team")
+        return requested
+    if len(matches) != 1:
+        raise RuntimeError(f"Exactly one Developer ID Application certificate for {TEAM} is required, or set DEVELOPER_IDENTITY_SHA1 to an exact valid fingerprint")
+    return matches[0]
+
+
 def selftest():
     assert next_version(["1.9", "1.10"], ["1", "9"]) == ("1.11", "10")
     assert next_version(["1.1", "2.0.4"], ["3", "4"]) == ("2.0.5", "5")
+    first, second = "A" * 40, "B" * 40
+    identities = f'1) {first} "Developer ID Application: Example ({TEAM})"\n2) {second} "Developer ID Application: Example ({TEAM})"'
+    assert select_identity(f'1) {first} "Developer ID Application: Example ({TEAM})"') == first
+    assert select_identity(identities, second) == second
+    assert select_identity(identities, second.lower()) == second
+    for text, requested in ((identities, None), (identities, "C" * 40)):
+        try:
+            select_identity(text, requested)
+        except RuntimeError:
+            continue
+        raise AssertionError("Ambiguous or unavailable signing identity accepted")
     for value in ("../1", "1..2", "", "1.2-beta", "1.2.3.4"):
         try:
             version_parts(value)
@@ -81,7 +105,7 @@ def selftest():
         except ValueError:
             continue
         raise AssertionError("Invalid build accepted")
-    print("PASS: release numbering and unsafe input checks", flush=True)
+    print("PASS: release numbering, identity selection, and unsafe input checks", flush=True)
 
 
 def info(app):
@@ -119,10 +143,7 @@ def main():
     ROOT.joinpath(".release").mkdir(exist_ok=True)
     run("Existing update key without prompts", "/usr/bin/swift", ROOT / "signing.swift", "check", ACCOUNT, PUBLIC_KEY)
     identity_text = run("Developer ID identity", "security", "find-identity", "-v", "-p", "codesigning")
-    matches = re.findall(r'\b([0-9A-Fa-f]{40})\s+"Developer ID Application: [^"\n]+ \(' + TEAM + r'\)"', identity_text)
-    if len(matches) != 1:
-        raise RuntimeError("Exactly one Developer ID Application certificate for F57QJC4XU3 is required")
-    identity = matches[0]
+    identity = select_identity(identity_text, os.environ.get("DEVELOPER_IDENTITY_SHA1"))
     prepare_checkout()
     feed = CHECKOUT / f"appcasts/{SLUG}.xml"
     versions, builds = ["1.0"], ["1"]
